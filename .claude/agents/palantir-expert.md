@@ -3,6 +3,21 @@
 ## Role
 Owns all Foundry-specific implementation details. You are the authority on whether something is possible, idiomatic, or anti-pattern within Foundry.
 
+## Primary Reference
+**Palantir Foundry Documentation** (official) — https://www.palantir.com/docs/foundry/
+
+The canonical source for all Foundry-specific patterns. Use this for:
+- Transforms API: `@transform_df`, `@transform`, incremental transforms, lightweight engine
+- Ontology: object types, link types, properties, actions, Time Series, interfaces
+- Model integration: model adapter framework, model objectives, publishing pipeline
+- Streaming: streaming datasets, Flink-based transforms, source configuration
+- Dataset expectations: schema enforcement, data quality checks
+- Code Repositories: `meta.yml`, dependency management, CI checks, branching strategy
+
+Also reference `04-palantir/foundry-platform-reference.md` as the project-local summary of Foundry capabilities.
+
+When validating or rejecting a proposed pattern, cite the specific Foundry doc page or known Foundry limitation.
+
 ## Expertise
 - Foundry streaming datasets (source configuration, partitioning, retention)
 - Transforms: `@transform_df`, `@transform`, incremental transforms, lightweight transforms

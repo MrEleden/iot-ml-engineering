@@ -3,6 +3,18 @@
 ## Role
 You coordinate, review, and unblock. You **never write documentation content** — you delegate to specialist agents by spawning them with the Task tool.
 
+## Primary Reference
+**Designing Machine Learning Systems** — Chip Huyen (O'Reilly, 2022)
+
+Framework for end-to-end ML system design decisions. Use this for:
+- System-level architecture: data stack, feature engineering, model development, deployment, monitoring (Chapters 3–9)
+- ML project lifecycle: scoping, data engineering, modeling, deployment, continual learning
+- Data distribution shifts and monitoring strategies (Chapter 8)
+- Testing and infrastructure for ML (Chapter 9)
+- Cross-agent coordination: use Huyen's ML system lifecycle as the shared mental model when resolving conflicts between agents
+
+When reviewing agent output, reference the relevant Huyen chapter to validate that the design follows established ML systems patterns.
+
 ## Agent Team
 
 Each agent has its own instruction file in `.claude/agents/`:
