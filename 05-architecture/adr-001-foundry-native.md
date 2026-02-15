@@ -53,6 +53,20 @@ Concretely, this means:
 
 **Cost opacity.** Foundry compute costs are bundled into the platform license. It's harder to attribute specific dollar costs to specific pipeline stages compared to standalone Spark on a cloud provider where cost per cluster-hour is transparent.
 
+### ML Lifecycle Capabilities
+
+Choosing Foundry-native means relying on Foundry's ML lifecycle tooling. An honest evaluation of Foundry's support for each lifecycle stage:
+
+**Experiment tracking.** Foundry Code Workspaces support notebook-style experimentation with parameter logging and metric tracking. Results can be persisted to datasets, providing basic experiment tracking. However, this is less mature than dedicated tools like MLflow or Weights & Biases — there is no built-in experiment comparison UI, no hyperparameter search orchestration, and metric visualization requires manual dashboard construction. Mitigation: we define a standardized experiment output schema (see [Experiment Tracking](../06-modeling/experiment-tracking.md)) and build comparison logic as a Foundry transform.
+
+**Model registry.** Foundry ML provides model resource objects that version model artifacts alongside their training metadata. Models are stored as Foundry resources with lineage to their training data and code, which is stronger than standalone MLflow (where lineage must be manually maintained). The registry supports promoting models through stages (development → staging → production) via Foundry's branching and tagging primitives. This is adequate for our needs.
+
+**Model versioning.** Every model artifact in Foundry is version-controlled through the platform's resource versioning. Model versions are tied to specific code commits and training data snapshots, enabling full reproducibility. Semantic versioning is applied manually as a naming convention rather than enforced by the platform.
+
+**A/B testing and shadow deployment.** Foundry does not natively support A/B testing or shadow scoring for models. Implementing shadow deployment (running a new model version alongside the production model and comparing outputs without acting on the new model's results) requires building a custom scoring transform that reads from two model versions and writes both score columns to the output dataset. This is tractable but adds pipeline complexity. See [ADR-002](./adr-002-batch-plus-streaming.md) for the shadow scoring design.
+
+**Automated retraining triggers.** Foundry supports scheduled pipeline runs but does not have built-in concept of drift-triggered retraining. We implement this by running a monitoring transform that computes drift metrics (PSI, score distribution divergence) on each batch scoring run. When drift exceeds configured thresholds, the monitoring transform writes a trigger record to a `retraining_triggers` dataset, which a downstream scheduling mechanism picks up. This is more manual than platforms like SageMaker Model Monitor but is implementable within Foundry's transform framework.
+
 ## Alternatives Considered
 
 ### Azure Databricks + Delta Lake + Airflow

@@ -35,6 +35,7 @@ Start with [Model Selection](./model-selection.md) to understand what we're buil
 - **100K+ devices**: Per-device models are expensive — start with fleet-wide and cohort before scaling to per-device for high-value assets
 - **14 sensors → ~45 features**: Features are time-windowed aggregations defined in [Contract 3](../05-architecture/data-contracts.md)
 - **Batch + streaming scoring**: Hourly batch for routine monitoring, near-real-time for acute anomalies (see [ADR-002](../05-architecture/adr-002-batch-plus-streaming.md))
+- **Monitoring ownership**: ML Scientist defines model performance metrics (maintenance lift, score distribution shape, drift thresholds) and degradation criteria (when metrics indicate retraining is needed). ML Platform implements the monitoring infrastructure (scheduled drift detection Transforms, alerting pipelines, dashboards). Drift detection — including feature distribution shift (KS test, PSI) and concept drift (declining maintenance lift) — is a modeling responsibility defined here and operationalized in [Monitoring](../03-production/monitoring.md)
 
 ## Upstream Dependencies
 

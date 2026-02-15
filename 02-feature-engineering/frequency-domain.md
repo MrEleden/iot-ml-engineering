@@ -158,6 +158,16 @@ FFT is not a native PySpark function. It requires a Pandas UDF (or equivalent) t
 
 The bottleneck is not the FFT itself but the Arrow serialization between Spark and Pandas. Profile before optimizing — this may not be a bottleneck at all.
 
+### Spectral Feature Drift Monitoring
+
+Spectral features are sensitive to operational pattern changes that may not affect time-domain statistics:
+
+**Seasonal shifts in compressor cycling**: compressor cycle frequency varies with thermal load. Summer heat forces more frequent cycling (shorter periods, higher dominant frequency), while mild weather allows longer cycles. A spectral entropy increase fleet-wide in spring is expected seasonal behavior, not model drift. Monitoring should compare spectral feature distributions against the same calendar month from the prior year, not just the prior week.
+
+**Firmware update impacts**: firmware updates that change compressor control logic (e.g., adjusting minimum run time, changing setpoint deadband) directly alter the cycling pattern that spectral features measure. A firmware rollout to 10K devices will appear as abrupt spectral drift for those devices. The monitoring system must be able to filter by firmware version (available in the device registry via the [Ontology](../04-palantir/ontology-design.md)) to distinguish firmware-driven spectral changes from equipment degradation.
+
+**Relationship to time-domain monitoring**: spectral drift often co-occurs with time-domain distribution shifts (e.g., a change in `current_compressor_std` accompanies a change in spectral entropy). Link spectral monitoring to the [time-domain feature distribution monitoring](./time-domain.md) to avoid duplicate alerting. When both time-domain and spectral drift are detected simultaneously, a single investigation covers both.
+
 ### Schema Implications
 
 Spectral features are **not currently in the [`device_features` Contract 3 schema](../05-architecture/data-contracts.md)**. Before adding them:
@@ -167,6 +177,26 @@ Spectral features are **not currently in the [`device_features` Contract 3 schem
 3. Follow the [schema evolution strategy](../05-architecture/data-contracts.md) — add nullable columns, never change existing ones
 
 This is intentional conservatism. Spectral features at 1/min sampling are experimental. The time-domain features (mean, std, slope) and cross-sensor features (pressure ratio, temperature spreads) are more reliable for anomaly detection at this sampling rate and should be the primary feature set.
+
+### Validation Protocol for Spectral Features
+
+Before adding spectral features to the production schema, run the following validation protocol to confirm they improve anomaly detection:
+
+**Cohort selection**: select 1,000 devices with known anomaly events (from maintenance logs or operator feedback) and 1,000 control devices with no reported issues over the same period. Both cohorts should span multiple equipment models and geographic regions to avoid confounding.
+
+**A/B feature set comparison**:
+- Feature set A (baseline): time-domain + cross-sensor features only (current Contract 3 columns)
+- Feature set B (candidate): baseline features + spectral features (spectral entropy, dominant frequency, spectral energy ratio)
+
+Train the same anomaly detection model (Isolation Forest with identical hyperparameters) on both feature sets using the same temporal train/test split.
+
+**Primary metric**: precision@k, where k = the top 5% of anomaly scores per fleet cohort. This measures whether the highest-scored devices are truly anomalous. Precision@k is preferred over AUC for unsupervised anomaly detection because it evaluates the actionable tail of the score distribution.
+
+**Minimum improvement threshold**: spectral features must improve precision@k by at least 5% (absolute) over the baseline feature set. Marginal improvements below this threshold do not justify the added compute cost and schema complexity.
+
+**Generalization check**: validate on a held-out 3-month period not used during development. If spectral features improve precision during the development period but not during the held-out period, they are overfitting to temporal artifacts and should not be promoted to production.
+
+Document results in an [experiment tracking](../06-modeling/experiment-tracking.md) entry. The decision to add spectral columns to Contract 3 requires agreement between the Feature Engineer and ML Scientist.
 
 ## What Would Require Higher-Rate Data
 

@@ -220,6 +220,119 @@ Foundry manages Spark cluster sizing. You cannot set `spark.executor.memory` or 
 
 You *can* set Spark profile hints in the Transform configuration (small, medium, large, x-large compute profiles), which influence the cluster Foundry provisions. Default to medium; scale up only after profiling.
 
+## ML-Specific Transform Patterns
+
+The patterns above cover general IoT data processing. The following patterns address ML-specific requirements: constructing correct training datasets, preventing training-serving skew, backfilling features after schema changes, and validating feature quality.
+
+### Point-in-Time Feature Joins
+
+Training an anomaly detection model requires labeled events (e.g., maintenance records, expert-flagged anomalies) joined with the sensor features that were available *at that point in time*. A naive join — match on `device_id` and take the latest features — creates data leakage by including future information.
+
+The correct pattern: for each labeled event at time T on device D, filter sensor readings to `timestamp <= T` and compute features from that filtered window.
+
+```python
+@transform_df(
+    Output("/Company/pipelines/refrigeration/training/point_in_time_features"),
+    labels=Input("/Company/pipelines/refrigeration/labels/maintenance_events"),
+    readings=Input("/Company/pipelines/refrigeration/raw/sensor_readings"),
+)
+def point_in_time_features(labels, readings):
+    # For each label (device_id, event_time), get readings up to event_time
+    joined = labels.join(readings, on="device_id", how="inner")
+    filtered = joined.filter(F.col("timestamp") <= F.col("event_time"))
+    
+    # Compute features within a lookback window (e.g., 24h before the event)
+    windowed = filtered.filter(
+        F.col("timestamp") >= F.col("event_time") - F.expr("INTERVAL 24 HOURS")
+    )
+    
+    return (
+        windowed
+        .groupBy("device_id", "event_time")
+        .agg(
+            F.avg("temp_evaporator").alias("temp_evaporator_mean"),
+            F.stddev("temp_evaporator").alias("temp_evaporator_std"),
+            F.avg("current_compressor").alias("current_compressor_mean"),
+            F.stddev("current_compressor").alias("current_compressor_std"),
+            F.avg("pressure_high_side").alias("pressure_high_mean"),
+            F.avg("vibration_compressor").alias("vibration_compressor_mean"),
+            F.count("*").alias("reading_count"),
+        )
+    )
+```
+
+This Transform is expensive — it performs a cross-join-like operation filtered by time. It is not run incrementally; it runs on-demand when retraining is triggered. Limit the label set to the relevant time range to control compute cost.
+
+### Training-Serving Skew Prevention
+
+Training-serving skew occurs when the features used at training time differ from the features used at scoring time — different column names, different aggregation windows, different null handling. In Foundry, prevent this by:
+
+1. **Shared feature Transform**: use the same Transform function for both training feature computation and production scoring feature computation. Extract the feature logic into a shared Python module within the Code Repository, imported by both the training and scoring Transforms.
+
+2. **Contract enforcement**: the model adapter's `api()` method defines the expected input schema (see [Model Integration](./model-integration.md)). Ensure the output schema of the feature Transform matches the model adapter's input schema exactly. Column name mismatches, type differences, or missing columns will cause silent scoring errors.
+
+3. **Validation via dataset expectations**: attach expectations to the feature dataset that verify column presence, types, and value ranges. If a code change inadvertently alters the feature Transform output, the expectation failure catches it before the scoring Transform runs.
+
+```python
+# Shared feature computation module: features/common.py
+def compute_device_features(readings_df):
+    """Shared feature logic used by both training and scoring Transforms."""
+    return (
+        readings_df
+        .groupBy("device_id")
+        .agg(
+            F.avg("temp_evaporator").alias("temp_evaporator_mean"),
+            F.stddev("temp_evaporator").alias("temp_evaporator_std"),
+            F.avg("current_compressor").alias("current_compressor_mean"),
+            F.stddev("current_compressor").alias("current_compressor_std"),
+            F.avg("pressure_high_side").alias("pressure_high_mean"),
+            F.avg("vibration_compressor").alias("vibration_compressor_mean"),
+            F.avg("superheat").alias("superheat_mean"),
+            F.avg("subcooling").alias("subcooling_mean"),
+            F.count("*").alias("reading_count"),
+        )
+    )
+```
+
+### Feature Backfill
+
+When a new feature is added (e.g., a new sensor becomes available) or an existing feature's computation logic changes, the feature dataset must be backfilled — recomputed over historical data so that training and scoring operate on a consistent feature set.
+
+In Foundry, a feature backfill means triggering a **full recompute** of the affected feature Transform. This is expensive on historical data (potentially billions of rows), so follow this protocol:
+
+1. **Trigger the full recompute**: use Foundry's "force full build" option on the feature Transform. Schedule it during off-peak hours.
+2. **Verify backfilled values**: after the recompute, compare a sample of the new feature values against manually computed expected values. Attach a dataset expectation that checks the new column is non-null for records after the feature's availability date.
+3. **Document the "feature available since" date**: record in the feature metadata (or a feature changelog dataset) the date from which each feature is reliably available. Models trained on data before this date will have null values for the new feature — the training pipeline must handle this (e.g., imputation or exclusion).
+
+### Dataset Expectations on Feature Datasets
+
+Dataset expectations serve as automated quality gates for feature datasets. Attach `@check` annotations to feature Transforms to validate that the output meets ML-specific quality requirements.
+
+```python
+from transforms.api import transform_df, Input, Output, Check
+from transforms import expectations as E
+
+@transform_df(
+    Output(
+        "/Company/pipelines/refrigeration/features/device_features",
+        checks=[
+            Check(E.col("reading_count").gt(0), "reading_count must be positive", on_error="WARN"),
+            Check(E.col("temp_evaporator_mean").is_not_null(), "evaporator temp must not be null", on_error="FAIL"),
+            Check(E.col("anomaly_score").gte(0.0) & E.col("anomaly_score").lte(1.0), "anomaly_score must be in [0, 1]", on_error="FAIL"),
+            Check(E.col("reading_count").gte(100), "at least 100 readings per device", on_error="WARN"),
+        ],
+    ),
+    sensor_readings=Input("/Company/pipelines/refrigeration/raw/sensor_readings"),
+)
+def compute_device_features(sensor_readings):
+    # Feature computation logic
+    ...
+```
+
+Expectations at the `WARN` level flag issues without blocking downstream Transforms — useful for soft constraints like minimum reading counts. Expectations at the `FAIL` level mark the output transaction as unhealthy and prevent downstream scoring Transforms from consuming bad data.
+
+Review expectation violations regularly. A sustained `WARN` on `reading_count` may indicate device connectivity issues that degrade model input quality before they cause scoring failures.
+
 ## Related Documents
 
 - [Streaming Ingestion](./streaming-ingestion.md) — how data arrives in the streaming dataset that Transforms consume

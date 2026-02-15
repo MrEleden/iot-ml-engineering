@@ -102,6 +102,42 @@ Everything in this document is a workaround. None of these evaluation strategies
 
 **Cadence**: computed during training (as part of the training Transform) and written to a metrics dataset. See [Experiment Tracking](./experiment-tracking.md).
 
+### Strategy 5: Statistical Drift Detection
+
+**What**: detect when the distribution of input features or model scores has shifted from the training distribution. Distribution shift is the primary cause of silent model degradation — the model's learned "normal" no longer matches reality, but no single scoring run reveals the problem.
+
+**Detection methods**:
+
+1. **Kolmogorov-Smirnov (KS) test**: for each feature, compare the current scoring window's distribution against the training distribution. The KS statistic measures the maximum difference between the two cumulative distribution functions. Apply **Bonferroni correction** for multiple comparisons: with ~45 features, use a significance threshold of p < 0.05/45 ≈ 0.0011 to control the family-wise error rate. Log the KS statistic and p-value per feature per scoring window.
+
+2. **Population Stability Index (PSI)**: bin each feature into 10 equal-frequency buckets (deciles from the training distribution). For each bucket, compute PSI = Σ (P_current - P_training) × ln(P_current / P_training). Interpretation thresholds:
+   - PSI < 0.1: no significant drift
+   - PSI 0.1–0.25: moderate drift — investigate but do not retrain automatically
+   - PSI > 0.25: significant drift — the feature distribution has shifted meaningfully
+
+3. **KL divergence**: compute the Kullback-Leibler divergence between training and current feature distributions. More sensitive to tail changes than PSI but requires density estimation. Use kernel density estimation (KDE) with bandwidth selected by Silverman's rule. KL divergence is asymmetric — compute in both directions and report the maximum.
+
+**Implementation**: implement drift detection as a scheduled Foundry Transform that reads the training data summary statistics (stored at training time) and the latest scoring window's feature values. The Transform produces a `drift_metrics` dataset with columns: `scoring_window_start`, `feature_name`, `ks_statistic`, `ks_p_value`, `psi_value`, `kl_divergence`, `drift_severity` (none / moderate / significant).
+
+**Alerting rules**:
+- **Warning**: >3 features have PSI > 0.25 in a single scoring window. Notify the ML Scientist for investigation.
+- **Auto-retrain trigger**: >5 features have PSI > 0.25 for 3 consecutive scoring windows. This sustained multi-feature drift indicates a regime change (seasonal shift, fleet composition change) that requires retraining. The trigger initiates the retraining pipeline (see [Training Pipeline](./training-pipeline.md), Trigger-Based Retraining).
+- **Emergency alert**: any feature has PSI > 1.0 (catastrophic shift — e.g., a sensor firmware update changing the scale of a measurement). Halt scoring with this model and fall back to the threshold baseline until the shift is investigated.
+
+**Cadence**: computed on every scoring run. Drift metrics are tracked over time to distinguish transient shifts (weather events, holidays) from sustained drift (seasonal change, fleet turnover).
+
+### Types of Distribution Shift
+
+Not all distribution shifts are the same. Understanding the type of shift helps determine the correct response.
+
+**Covariate shift**: the input feature distribution P(X) changes, but the relationship between features and anomaly status P(Y|X) remains the same. IoT example: summer ambient temperatures shift the entire `temp_ambient_mean` distribution upward. The same temperature patterns still indicate the same anomaly types — the model just hasn't seen data from this temperature range. Response: retrain on data that includes the new covariate range (extend training window to cover the season).
+
+**Label shift (prior probability shift)**: the prevalence of anomalies P(Y) changes, but the feature patterns of anomalies P(X|Y) remain the same. IoT example: a fleet-wide firmware bug causes 15% of devices to exhibit the same failure pattern (vs. the usual 3%). The anomaly pattern is the same, but more devices are affected. Response: adjust the contamination rate / threshold, not the model itself. The model's learned patterns are still correct.
+
+**Concept drift**: the relationship P(Y|X) changes — what used to be normal is now anomalous, or vice versa. IoT example: a new refrigerant type with different pressure-temperature characteristics is deployed. The model's learned normal pressure ratios are now wrong for devices using the new refrigerant. Response: retrain with data from the new regime. This is the most dangerous type of shift because it can be silent — the model produces scores confidently, but they're based on an outdated concept of normality.
+
+**How to distinguish shift types**: covariate shift shows up in feature distribution tests (KS, PSI) but not in model output distribution changes. Label shift shows up in the anomaly rate changing but feature distributions staying stable. Concept drift may show up as degraded maintenance lift or expert-reviewed precision without obvious feature distribution changes. Monitor all three signals.
+
 ---
 
 ## Establishing Baselines
@@ -211,6 +247,27 @@ When a new model version is trained (different hyperparameters, new features, or
 
 **Implementation**: the scoring Transform produces `model_scores` with `model_id` and `model_version` columns (Contract 5). Both models write to the same dataset. Downstream analysis Transforms compare metrics between model IDs.
 
+### Shadow and Canary Deployment
+
+Before running a full A/B test, use progressive deployment stages to reduce risk:
+
+**Shadow deployment**: run the new model on 100% of production data, but do not route its scores to the alert pipeline. Both the production model and the shadow model score every device in every window. The shadow model's scores are written to `model_scores` with a distinct `model_id` (e.g., `isolation_forest_fleet_v2_shadow`) but are excluded from alert generation by the alert pipeline's model whitelist. Compare shadow model scores against the production model over 2–4 weeks:
+- Score rank correlation between shadow and production models
+- Alert volume difference (how many more/fewer devices would be flagged)
+- Maintenance lift on the shadow model's scores (retrospective)
+- Divergence cases for expert review
+
+Shadow deployment carries zero operational risk — no alerts are changed. It answers: "how would the new model behave if we deployed it?"
+
+**Canary deployment**: route the new model's scores to alerts for a small subset of the fleet (5% of devices, randomly selected and stratified by cohort). The remaining 95% continue using the production model. Monitor the canary group for 1–2 weeks:
+- Alert volume in the canary group vs. the control group (same-sized random sample from the 95%). If alert volume in the canary group exceeds 2× the control group's rate, auto-rollback to the production model.
+- Expert review of canary alerts for precision estimation.
+- Maintenance correlation for the canary group.
+
+Canary deployment carries limited operational risk (5% of fleet) and catches issues that shadow deployment misses — such as alert fatigue from increased volume or downstream pipeline failures caused by score distribution changes.
+
+**Recommended progression**: Shadow (2–4 weeks) → Canary at 5% (1–2 weeks) → A/B test at 50/50 (2–4 weeks) → Full rollout. Each stage must pass before advancing to the next. At any stage, revert to the production model if metrics degrade.
+
 ### Graduation Criteria
 
 A new model version replaces the production model when:
@@ -222,6 +279,24 @@ A new model version replaces the production model when:
 5. **No regression on internal metrics** (score distribution shape, reconstruction error distribution).
 
 If any criterion is ambiguous, require manual approval from the ML Scientist and operations lead before promotion.
+
+### Feedback Loop Risks
+
+Anomaly detection systems that trigger maintenance actions create a **feedback loop**: the model flags a device → maintenance is performed → post-maintenance data looks normal → the failure pattern that triggered the alert is now followed by "normal" data → the model has less training data for that failure pattern → sensitivity to that failure mode decreases over time.
+
+This is the **maintenance feedback loop** and it's insidious because each cycle is individually rational (fix what's flagged) but the cumulative effect degrades the model.
+
+**Concrete example**: the model detects compressor bearing degradation (rising vibration over 2 weeks). Maintenance replaces the bearing. Post-replacement vibration drops to baseline. If the rolling training window includes the post-maintenance period, the "rising vibration → maintenance" pattern is partially overwritten by "normal vibration" data. After several such cycles, the model's learned boundary for vibration anomalies shifts upward — it now requires more extreme vibration to flag, reducing early detection.
+
+**Mitigations**:
+
+1. **Preserve pre-maintenance windows in the failure exemplar set.** When a maintenance event is triggered by a model alert, archive the device's feature windows from 48 hours before through the maintenance event in the `failure_exemplars` dataset (see [Training Pipeline](./training-pipeline.md), Rolling Window "Forgetting" Risk). These exemplars persist across training cycles and prevent the model from "forgetting" what pre-failure patterns look like.
+
+2. **Tag maintenance-triggered data.** Label post-maintenance windows (48 hours after a confirmed maintenance event) with `post_maintenance = true` in the feature dataset. This enables analysis of whether the model is treating post-maintenance data differently from organic normal data.
+
+3. **Monitor recall proxies over time.** Track the maintenance lift metric across consecutive model versions. A declining maintenance lift (e.g., from 3.2× to 2.5× to 2.0× over 6 months) may indicate the feedback loop is eroding sensitivity. Also track lead time — shortening lead times (from 22 hours to 14 hours to 8 hours) suggest the model is detecting failures later, possibly because it has adapted to the early-stage pattern as "normal."
+
+4. **Counterfactual holdout (advanced).** For a random 2–5% of devices that the model flags as anomalous, do not trigger maintenance alerts (suppress the alert internally, but log the suppression). Monitor these devices to see if they actually fail. This provides an unbiased estimate of the model's true positive rate — without the confounding effect of maintenance intervening. This is operationally risky (a device could fail if the alert was real) and should be limited to LOW-severity alerts only, never HIGH or CRITICAL.
 
 ---
 

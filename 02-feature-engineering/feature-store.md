@@ -112,6 +112,26 @@ The full 50+ feature columns remain in the offline store. Pre-hydrating all of t
 
 For the refrigeration use case, hourly freshness is acceptable — maintenance decisions don't require sub-minute feature data. If sub-minute freshness is ever needed for specific properties (e.g., for real-time anomaly scoring), consider Foundry's streaming Ontology sync as described in the [Ontology Design doc](../04-palantir/ontology-design.md).
 
+### Training-Serving Consistency
+
+A subtle source of model degradation is divergence between the feature values a model saw during training (offline store) and the values presented at inference time (online store or model-input transform). Even small differences compound across 50+ features.
+
+**Risk areas**:
+
+- **Pre-hydration transform divergence**: the transform that writes Ontology properties may apply rounding, casting, or formatting that differs from how the offline store presents the same feature. For example, casting a `double` to `float` for Ontology storage introduces precision loss that the model did not encounter during training.
+- **Rounding and casting differences**: PySpark and Pandas may produce slightly different floating-point results for the same aggregation. If the training pipeline uses PySpark but the scoring pipeline uses a Pandas-based model-input transform, numerical differences can accumulate.
+- **Feature subset mismatch**: the model expects features `[A, B, C]` but the serving path provides `[A, B, D]` due to a schema evolution where C was renamed to D. The model silently receives incorrect input.
+
+**Prevention via weekly reconciliation check**: run a weekly validation transform that:
+
+1. Selects 1,000 random device-window pairs from the latest day
+2. Reads feature values from the offline store (`device_features` Delta Lake)
+3. Reads the same features from the online serving path (Ontology properties or model-input transform output)
+4. Compares values pair-wise with a tolerance of 1e-6 for floating-point features
+5. Alerts the data engineering team if more than 0.1% of comparisons exceed tolerance
+
+This reconciliation catches transform bugs, schema drift, and numerical inconsistencies before they affect model performance.
+
 ### Time Series as Complementary Access Pattern
 
 The Ontology also serves raw sensor history via Time Series properties on the Device object (see [Ontology Design — Time Series Properties](../04-palantir/ontology-design.md)). Time Series properties serve raw 1-minute readings for per-device drill-down and trend visualization. Pre-hydrated scalar properties (described above) serve current-state summaries for fleet overview. The feature store's windowed aggregations sit between these two granularities — more processed than raw Time Series, less summarized than scalar properties.
@@ -207,6 +227,28 @@ Each feature should have metadata that records when it was added and how its com
 
 This metadata lives in documentation (this file and [data contracts](../05-architecture/data-contracts.md)), not in the dataset itself. Foundry's dataset lineage provides the authoritative history of when transforms changed.
 
+### Feature Statistics as Model Artifact
+
+When a model is trained, the feature statistics from the training set must be saved as part of the model artifact. This serves two purposes: drift detection baseline and debugging out-of-distribution inputs at inference time.
+
+**What to save per feature**:
+
+| Statistic | Purpose |
+|-----------|---------|
+| Mean | Drift detection baseline, z-score scaling parameter |
+| Std | Drift detection baseline, z-score scaling parameter |
+| Min / Max | Detect out-of-range inputs at inference |
+| p5 / p25 / p50 / p75 / p95 | Distribution shape reference for PSI computation |
+| Null fraction | Baseline for data quality monitoring |
+
+**What to save globally**:
+
+- **Training time range**: `min(window_start)` to `max(window_end)` of the training set. Enables auditing which data the model learned from.
+- **Device count**: number of distinct `device_id` values in the training set. Documents fleet coverage.
+- **Feature list**: ordered list of feature names matching the model's input schema ([Contract 4](../05-architecture/data-contracts.md)).
+
+Store this as a JSON file alongside the serialized model in Foundry's model artifact storage. The monitoring system reads this reference snapshot to compute PSI and other drift metrics. When a new model is trained, a new reference snapshot is generated automatically.
+
 ### Model-Feature Compatibility
 
 Each trained model records the feature list it was trained on (see [Contract 4](../05-architecture/data-contracts.md): `feature_names` in model input). When the feature schema changes:
@@ -252,6 +294,55 @@ def compute_features(clean):
 ### Alerting on Stale Features
 
 Stale feature alerts should go to the data engineering team, not the maintenance operators who receive equipment alerts. A stale feature is a pipeline problem, not an equipment problem. However, downstream scoring and alerting should indicate reduced confidence when features are stale — the `sensor_completeness` and `reading_count` fields already serve this purpose at the individual-device level.
+
+## Feature Distribution Monitoring
+
+Freshness monitoring (above) catches pipeline failures — features stop updating. Distribution monitoring catches a subtler problem: features continue updating but their statistical properties shift, causing trained models to operate on data that no longer resembles the training set.
+
+### What to Track
+
+For each numeric feature column in `device_features`, compute the following statistics daily across the active fleet:
+
+| Statistic | What It Catches |
+|-----------|-----------------|
+| Mean | Fleet-wide baseline shift (e.g., seasonal temperature change) |
+| Std | Variance change (fleet becoming more or less homogeneous) |
+| p5 / p50 / p95 | Shape changes beyond mean and std (skewness, heavy tails) |
+| Null fraction | Upstream data quality degradation or sensor dropout |
+| PSI (Population Stability Index) | Overall distributional shift, binned comparison against reference |
+
+### Reference Distribution
+
+The reference distribution is a snapshot of per-feature statistics from the model's training set, stored with the model artifact (see [Feature Statistics as Model Artifact](#feature-statistics-as-model-artifact) above). When a new model is deployed, its reference snapshot becomes the baseline for drift detection. Multiple models may have different reference snapshots if trained on different time periods.
+
+### Drift Detection Thresholds
+
+PSI thresholds, calibrated for this domain:
+
+| PSI Range | Interpretation | Action |
+|-----------|---------------|--------|
+| < 0.1 | No significant drift | Continue monitoring |
+| 0.1 – 0.25 | Moderate drift | Investigate — is it seasonal, fleet composition, or degradation? |
+| > 0.25 | Significant drift | Trigger retraining evaluation with ML Scientist |
+
+These thresholds apply per feature. When 5+ features simultaneously cross the moderate threshold, treat it as a significant fleet-wide event even if no individual feature crosses 0.25.
+
+### Null Fraction Escalation
+
+A rising null fraction for a feature that was historically non-null (e.g., `pressure_ratio` going from 1% null to 15% null) signals upstream data quality degradation — likely a sensor failure pattern or an ingestion pipeline issue. This is not a model retraining trigger; it is a data quality issue that should be escalated to the Data Engineer for root-cause investigation. The monitoring transform should file an automated alert when any feature's null fraction exceeds its training-set baseline by more than 5 percentage points.
+
+### Implementation
+
+Implement as a dedicated monitoring transform in Foundry:
+
+1. Reads the latest 1-day window partition from `device_features`
+2. Computes per-feature statistics (mean, std, percentiles, null fraction)
+3. Loads the reference snapshot from the active model artifact
+4. Computes PSI per feature against the reference
+5. Writes results to a `feature_drift_monitoring` dataset
+6. Foundry expectations on the monitoring dataset raise alerts when thresholds are crossed
+
+This transform runs daily and is lightweight (aggregating fleet-level statistics, not processing individual readings). See [Monitoring](../03-production/monitoring.md) for how feature drift integrates with the broader operational monitoring framework.
 
 ## Related Documents
 

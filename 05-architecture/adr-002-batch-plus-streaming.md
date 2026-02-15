@@ -98,6 +98,34 @@ Mitigation: derive streaming thresholds from batch model training — the batch 
 
 Mitigation: for known fast-developing failure modes (e.g., compressor seizure), add specific streaming rules. The streaming path is the safety net for the batch path's latency.
 
+### Threshold Synchronization
+
+The streaming path relies on per-device or per-cohort thresholds stored as Ontology properties. These thresholds must stay aligned with the batch models' learned decision boundaries. When a batch model is retrained, the following automated pipeline runs:
+
+1. The retrained model is evaluated on the held-out validation set to extract decision boundaries (e.g., the anomaly score threshold that achieves the target precision).
+2. For each streaming rule (compressor current, vibration, pressure drop rate, temperature rise rate), the corresponding feature's contribution to the anomaly score is analyzed to derive an equivalent absolute threshold.
+3. Updated thresholds are written to the Ontology as device or cohort properties via an Ontology Action, replacing the previous values.
+4. A threshold change log is appended to a `threshold_history` dataset for auditability.
+
+This ensures that streaming thresholds evolve together with batch models rather than drifting independently. Threshold updates take effect within the Ontology sync interval (typically < 5 minutes).
+
+### Model Deployment Strategy
+
+New batch model versions are deployed using a shadow scoring pattern before replacing the production model:
+
+1. **Shadow scoring.** The new model version runs alongside the production model on the same input features. Both models' scores are written to the `model_scores` dataset, but only the production model's scores feed the alert pipeline. The shadow model's scores are written with a `shadow = true` flag.
+2. **Comparison window.** Shadow scoring runs for a configurable period (default 7 days). During this window, the shadow model's score distribution, alert rate, and top contributors are compared against the production model.
+3. **Promotion criteria.** The shadow model is promoted to production if: (a) its score distribution does not diverge significantly from the production model (KL-divergence < 0.1), or if it diverges, the divergence is explained by known improvements; (b) its alert rate is within an acceptable range of the production model (no more than 20% increase in HIGH/CRITICAL alerts without explanation); (c) no regression in coverage (≥ 99% of devices scored).
+4. **Automatic rollback.** If the shadow model produces a scoring failure rate > 1% or a dramatic shift in score distribution (KL-divergence > 0.5), shadow scoring is automatically halted and an alert is raised.
+
+### Batch Output Monitoring
+
+Every batch scoring run produces summary statistics that are tracked over time to detect model degradation:
+
+- **Score distribution stability.** The mean, standard deviation, and key percentiles (p50, p90, p95, p99) of anomaly scores across the fleet are compared against the previous 30 runs. A shift exceeding 2 standard deviations of the historical distribution triggers an investigation alert.
+- **Alert volume tracking.** The number of devices flagged per severity level is tracked per run. Sustained increases in alert volume (> 15% above the 30-day moving average for 3+ consecutive runs) triggers a review to determine whether the increase reflects genuine fleet degradation or model drift.
+- **Coverage monitoring.** The percentage of active devices scored per run is tracked. Drops below 99% trigger a pipeline health alert.
+
 ## Alternatives Considered
 
 ### Pure Batch (Hourly)

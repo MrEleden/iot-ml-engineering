@@ -76,6 +76,16 @@ See [Model Integration](../04-palantir/model-integration.md#batch-scoring-via-tr
 
 **SLA**: batch scores available within **1 hour** of feature store update ([Contract 5 SLA](../05-architecture/data-contracts.md#contract-5-model-output--scored-dataset)).
 
+### Prediction Service SLA
+
+| SLA Dimension | Target | Measurement | Violation Response |
+|---|---|---|---|
+| Availability | 99.5% of scheduled scoring runs complete successfully | Successful builds / scheduled builds, 30-day rolling window | Auto-alert on-call; investigate build failures |
+| Device coverage | ≥ 99% of active devices receive a score per batch run | Scored device count / active device registry count | Alert if coverage drops below 99%; investigate excluded devices (low `sensor_completeness`, missing features) |
+| Scoring latency | 95% of batch runs complete within 45 minutes of feature store update | `scored_at` − latest `window_end` in input features | Scale compute profile; investigate data volume spikes |
+| Score freshness | Latest scores no more than 2 hours old during business hours | Wall clock − latest `scored_at` | After 2 hours: activate [rules-based fallback](#rules-based-fallback). After 4 hours: page on-call. |
+| Score correctness | Zero NaN, null, or out-of-range (∉ [0, 1]) values in `anomaly_score` | Dataset expectations on `model_scores` | Transform build fails and rolls back — enforced by expectations, not monitoring |
+
 ## Streaming Scoring
 
 The streaming path catches acute anomalies that can't wait for the next batch run. It does **not** run complex ML models — it applies lightweight threshold-based rules that detect dangerous conditions in near-real-time.
@@ -169,6 +179,24 @@ device_features
 
 Foundry handles concurrent writes to the same output dataset via transactions — each Transform commits its own transaction independently.
 
+### Model Optimization for Scoring Efficiency
+
+As the fleet grows and models become more complex, scoring efficiency determines whether the system can meet its latency SLA. Optimize before scaling compute.
+
+| Optimization | Technique | Expected Impact |
+|---|---|---|
+| Batch inference | Vectorize model inference using `model.predict(df)` on the full DataFrame instead of row-by-row iteration. For Isolation Forest, scikit-learn's `decision_function` is already vectorized. | 5–10× throughput improvement vs row-level scoring |
+| Model serialization format | Serialize models with `joblib` (scikit-learn) or ONNX (deep learning). Avoid `pickle` for large models — slower deserialization. | 2–3× faster model loading on cold start |
+| Feature subsetting | Score only features the model actually uses. If the feature store produces 50 features but the model uses 30, select only those 30 before converting to Pandas. | Reduces Spark-to-Pandas conversion time and memory |
+| Quantization | Not currently applied. Isolation Forest and statistical models are lightweight. Revisit if Autoencoder inference becomes a bottleneck (>15 min for fleet scoring). | Potential 2–4× speedup for neural models |
+| Pandas vs Spark inference | Current approach converts to Pandas for scikit-learn inference, which is correct for Isolation Forest. For very large fleets (>500K devices), consider Spark UDF-based inference to avoid collecting all features to the driver. | Avoids driver OOM at extreme scale |
+
+**When to revisit scoring efficiency**:
+- Scoring latency p95 exceeds 30 minutes for hourly batch
+- Fleet size grows beyond 200K devices
+- New model type (e.g., deep autoencoder) added with significantly higher inference cost
+- Compute profile needs to be upgraded more than twice in 6 months
+
 ### Model Agreement for Severity
 
 The [alert severity rules](../05-architecture/data-contracts.md#severity-rules) use model agreement:
@@ -250,6 +278,60 @@ def canary_scoring(features, canary_model, production_model, output):
 | Score distribution KL divergence | < 0.1 | Block promotion — distributions diverged |
 
 The canary Transform output goes to a dashboard, not to the production alert pipeline. Canary scores never generate real alerts.
+
+## Shadow Deployments
+
+Shadow deployments run a candidate model on full production data without affecting alerts. Unlike canary deployments (which compare two model versions on a single scoring run), shadow deployments run the candidate model silently alongside production for an extended period.
+
+### Shadow vs Canary
+
+| Dimension | Canary Deployment | Shadow Deployment |
+|---|---|---|
+| Duration | 1–3 scoring runs | 1–2 weeks |
+| Alert impact | None (canary scores go to dashboard only) | None (shadow scores go to a separate dataset, excluded from alert generation) |
+| Evaluation | Statistical comparison of score distributions | Extended evaluation including temporal stability, seasonal behavior, and false positive rate estimation |
+| Use case | Quick validation before promoting a retrained model | Validating a fundamentally new model type (e.g., Autoencoder v1 alongside existing Isolation Forest) or major architecture change |
+
+### Shadow Implementation
+
+The shadow model runs as its own scoring Transform writing to a dedicated output dataset that is **not** included in the alert generation pipeline:
+
+```python
+@transform(
+    output=Output("/Company/pipelines/refrigeration/scores/shadow_model_scores"),
+    features=Input("/Company/pipelines/refrigeration/features/device_features"),
+    shadow_model=ModelInput("/Company/models/refrigeration/autoencoder", version="v2.0.0-rc1"),
+)
+def shadow_scoring(features, shadow_model, output):
+    features_df = features.dataframe()
+    latest_window = features_df.agg(F.max("window_end")).collect()[0][0]
+    current_features = features_df.filter(F.col("window_end") == latest_window)
+    scorable = current_features.filter(F.col("sensor_completeness") >= 0.5)
+
+    scores_pd = shadow_model.transform({"features_df": scorable.toPandas()})["scores_df"]
+    scores_pd["model_id"] = "autoencoder_v2.0.0-rc1"
+    scores_pd["model_version"] = shadow_model.version
+    scores_pd["deployment_mode"] = "shadow"  # explicit marker
+    scores_pd["scored_at"] = datetime.utcnow()
+
+    output.write_dataframe(
+        spark.createDataFrame(scores_pd),
+        partition_cols=["scored_at_date"],
+    )
+```
+
+The alert generation Transform reads only from `model_scores`, not from `shadow_model_scores`. Shadow scores are available for offline analysis and dashboards but never generate operator-facing alerts.
+
+### Shadow Evaluation Criteria
+
+After the shadow period, evaluate before promoting to production:
+
+| Metric | Threshold | Rationale |
+|---|---|---|
+| Score distribution stability over shadow period | Stddev of daily mean score < 0.03 | Model should not oscillate day-to-day |
+| Agreement with production models | > 80% pairwise agreement on `anomaly_flag` | Shadow model should largely agree with production |
+| Coverage | Shadow model scores ≥ 99% of devices scored by production | Model should not silently skip devices |
+| Estimated false positive rate | Flag rate within ±3% of production model | Avoids introducing a model that would generate alert storms |
 
 ## Fallback Behavior
 

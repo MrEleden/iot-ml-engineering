@@ -82,6 +82,8 @@ This boundary ensures feature computation is correct and complete.
 
 **Soft vs hard expectations**: range checks on raw sensor values (Contract 2) are hard — violations are physically impossible. Range checks on derived features (Contract 3) are soft — a `pressure_ratio` of 15.0 is unusual but not impossible. Soft expectations log warnings instead of failing the build.
 
+> **Deriving soft thresholds from training data**: don't guess soft thresholds for derived features. Compute the 0.1st and 99.9th percentiles of each feature from the training dataset and use those as the soft expectation bounds. This ensures thresholds reflect the actual data distribution the model was trained on, not engineering intuition about what looks "reasonable." Store these percentile bounds alongside the model artifact and update them on every retrain. If a feature value falls outside the training-derived bounds it warrants a warning, but only values far outside (>10× the interquartile range) should trigger a hard failure.
+
 ### Contract 3 → 4: Feature Store → Model Input
 
 | Expectation | What It Checks | Failure Mode It Prevents |
@@ -216,6 +218,72 @@ Escalation: If > 4 hours stale, page on-call engineer
 SLAs are configured in Foundry's pipeline monitoring UI, not in Transform code. They check the transaction timestamp of the dataset, which Foundry updates automatically when a Transform writes successfully.
 
 **Gotcha**: a Transform that runs successfully but produces zero rows still updates the transaction timestamp. The dataset looks "fresh" but contains no new data. To catch this, add a secondary check: the row count of the latest transaction should be > 0 for datasets that always produce data (like hourly batch scores for 100K active devices).
+
+## Training-Serving Skew Detection
+
+Pure data quality checks (range validation, null checks, schema enforcement) catch data that is *broken*. Training-serving skew detection catches data that is *valid but different from what the model was trained on*. A temperature sensor reading of 15°C passes every range check but may indicate a completely different operating regime than the model saw during training.
+
+### What to Check
+
+| Check | Computation | Alert Threshold | What It Catches |
+|---|---|---|---|
+| Feature mean shift | \|current_mean − training_mean\| / training_stddev | > 2.0 (i.e., current mean is >2× stddev from training mean) | Gradual operational changes that are individually valid but collectively shift the feature space away from training conditions |
+| Feature range expansion | Fraction of current values outside [training_min, training_max] | > 10% of values fall beyond training range | New operating regimes the model never saw — extrapolation risk |
+| Feature correlation stability | \|current_corr(f_i, f_j) − training_corr(f_i, f_j)\| for key feature pairs | Change > 0.3 for any monitored pair | Broken cross-sensor relationships (e.g., compressor current no longer correlates with evaporator temp — suggests sensor or mechanical change) |
+| Null rate divergence | \|current_null_rate − training_null_rate\| per feature | > 5 percentage points | Sensor dropout patterns changed since training — imputation logic may no longer be appropriate |
+
+### Storing Training-Time Statistics
+
+Training-time statistics must be stored as a versioned dataset alongside the model artifact so that serving-time comparison is always against the correct reference:
+
+```python
+@transform_df(
+    Output("/Company/pipelines/refrigeration/models/training_statistics"),
+    training_features=Input("/Company/pipelines/refrigeration/features/training_snapshot"),
+)
+def compute_training_statistics(training_features):
+    """Compute and store feature statistics from the training dataset.
+    Run once per training cycle. Output is versioned with the model."""
+    stats = []
+    feature_cols = [c for c in training_features.columns
+                    if c not in ("device_id", "window_start", "window_end",
+                                 "window_duration_minutes", "sensor_completeness")]
+
+    for col_name in feature_cols:
+        col_stats = training_features.agg(
+            F.mean(col_name).alias("mean"),
+            F.stddev(col_name).alias("stddev"),
+            F.min(col_name).alias("min_val"),
+            F.max(col_name).alias("max_val"),
+            F.expr(f"percentile({col_name}, 0.001)").alias("p0_1"),
+            F.expr(f"percentile({col_name}, 0.999)").alias("p99_9"),
+            (F.count(F.when(F.col(col_name).isNull(), 1)) / F.count("*")).alias("null_rate"),
+        ).collect()[0]
+
+        stats.append({
+            "feature_name": col_name,
+            "training_mean": col_stats["mean"],
+            "training_stddev": col_stats["stddev"],
+            "training_min": col_stats["min_val"],
+            "training_max": col_stats["max_val"],
+            "training_p0_1": col_stats["p0_1"],
+            "training_p99_9": col_stats["p99_9"],
+            "training_null_rate": col_stats["null_rate"],
+        })
+
+    return spark.createDataFrame(stats)
+```
+
+Version this dataset with the model: when model `isolation_forest_v3` is trained, the corresponding `training_statistics` snapshot is tagged `v3`. The serving-time skew detection Transform reads the statistics version matching the currently deployed model.
+
+### Why This Matters
+
+Training-serving skew is the most common source of silent model degradation. The model doesn't crash, scores stay in [0, 1], and no data quality check fires — but the model is being applied to data it wasn't trained on. Common causes in IoT:
+
+- Seasonal shifts (winter → summer) change ambient temperature distributions
+- Fleet expansion adds devices with different baseline operating characteristics
+- Firmware updates change sensor calibration or reporting frequency
+- Maintenance campaigns fix issues the model was trained to detect, shifting the "normal" baseline
 
 ## Data Health Dashboards
 

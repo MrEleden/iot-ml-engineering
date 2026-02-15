@@ -153,6 +153,24 @@ The `schema_version` field enables:
 
 This is a device-side change that requires coordination with the firmware team. Until implemented, firmware version (from the device registry) serves as the implicit schema version.
 
+### Data Availability Timestamp for Leakage Prevention
+
+The landing zone carries two timestamps: `timestamp_device` (when the device claims the reading occurred) and `timestamp_ingested` (when IoT Hub received the message). Neither precisely captures when the data became queryable by downstream consumers. A third timestamp addresses this gap.
+
+**`timestamp_available`**: the time at which the reading became available in the batch view — i.e., the commit timestamp of the Delta Lake transaction that materialized the streaming dataset batch containing this reading.
+
+**Distinction from existing timestamps**:
+
+| Timestamp | Set by | Represents | Typical lag from event |
+|-----------|--------|------------|------------------------|
+| `timestamp_device` | Device firmware | When the sensor reading was taken | 0 (if clock is accurate) |
+| `timestamp_ingested` | IoT Hub | When the message was received by the cloud gateway | < 1s – 5s |
+| `timestamp_available` | Batch materialization | When the reading became queryable in the landing zone batch view | 1–10 min (materialization interval) |
+
+**Why it matters (Huyen, Ch. 5 — Data Leakage)**: when constructing training datasets, the relevant question is not "when did the event occur?" but "when was the data available to the model in production?" A model trained on readings filtered by `timestamp_device` may include data that, in production, would not yet have arrived at scoring time — especially for devices with buffered uploads, reconnection replays, or significant clock drift. Filtering by `timestamp_available` guarantees that every reading in the training set was actually queryable at the stated time, eliminating this form of temporal leakage.
+
+**Implementation**: the `timestamp_available` column is populated by the streaming dataset's batch materialization process. Each 5-minute materialization commit writes the commit timestamp to all rows in that transaction. In Foundry, this can be implemented as a post-materialization lightweight transform that stamps the Delta commit timestamp onto each row, or by reading the Delta transaction log metadata (`_commit_timestamp`) downstream. The column is added to Contract 1 as a nullable field — null for historical data predating the column's introduction, populated for all new data.
+
 ### Version Compatibility Matrix
 
 Maintain a compatibility matrix mapping firmware versions to expected sensor sets:
@@ -178,6 +196,27 @@ This matrix lives in the device registry (Foundry Ontology) and is used by the c
 4. **New columns are always nullable.** Adding a column never makes existing transforms fail — the column is null for historical data and populated for new data. Transforms that don't reference the new column are unaffected.
 
 5. **Quality flags are additive.** New flag values (e.g., a new `FIRMWARE_MISMATCH` flag) may appear in the `quality_flags` array. Consumers that check for specific flags are unaffected; consumers that iterate over all flags should handle unknown values gracefully.
+
+### For Training Data Consumers
+
+Training pipelines have additional schema concerns beyond what operational consumers need:
+
+1. **Minimum viable history per feature.** Each feature column has a date from which it is reliably populated across the fleet. Training on a feature that was added 30 days ago but treating it as available for the full 12-month training window produces a dataset that is mostly null for that feature. The `schema_change_log` dataset (below) provides the metadata needed to construct valid training windows per feature.
+
+2. **`schema_change_log` dataset.** A Foundry dataset that tracks schema evolution events relevant to training data construction:
+
+   | Column | Type | Description |
+   |--------|------|-------------|
+   | `column_name` | string | The sensor or derived column (e.g., `vibration_compressor`) |
+   | `date_added` | date | The date the column was added to the landing zone schema |
+   | `date_deprecated` | date (nullable) | The date the column entered deprecation (null if active) |
+   | `fleet_coverage_pct` | double | Percentage of active devices reporting non-null values for this column, updated weekly |
+   | `min_viable_training_date` | date | The earliest date at which `fleet_coverage_pct` exceeded 80% — the recommended start date for training data that uses this feature |
+   | `notes` | string (nullable) | Context: firmware version that introduced the sensor, known calibration changes, etc. |
+
+   This dataset is maintained manually (updated when schema changes occur) and consumed programmatically by training pipelines to validate that requested training windows have adequate coverage.
+
+3. **No backfilling raw data.** When a new sensor column is added, historical rows in the landing zone and training archive remain null for that column. The ingestion layer does not backfill raw data — devices that did not report a sensor at the time of the reading cannot retroactively produce that data. Training pipelines must handle the null-to-populated transition gracefully, either by restricting the training window to post-`min_viable_training_date` or by using imputation strategies documented in the feature engineering layer.
 
 ### For the Streaming Dataset
 

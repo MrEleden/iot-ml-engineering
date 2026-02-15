@@ -21,6 +21,8 @@ Every production model must have a model card following this structure. The temp
 - **Model type**: [Isolation Forest / Autoencoder / Statistical / DBSCAN]
 - **Granularity**: [fleet / cohort / device]
 - **Cohort**: [cohort name and definition, if cohort granularity. "N/A" for fleet/device.]
+- **Model age**: [number of days since last training completion] days
+- **Staleness warning**: [if model age > 90 days, display: "⚠️ MODEL STALE — last trained [date]. Recommended retraining cadence: [weekly/monthly]. Investigate why retraining has not occurred." Otherwise: "Model is within expected retraining cadence."]
 
 ## Features
 - **Feature store version**: [Contract 3 dataset path and transaction ID]
@@ -78,6 +80,14 @@ Conforms to Contract 5 (model_scores):
 - [Limitation 1 — be specific]
 - [Limitation 2]
 - [Limitation 3]
+
+## Fairness and Equity
+Anomaly detection models can systematically underserve certain device populations. Document potential equity concerns:
+
+- **Device type coverage**: which device types are underrepresented in the training data? Models trained predominantly on one device family (e.g., walk-in coolers) may have lower sensitivity for underrepresented types (e.g., display cases, blast chillers). List device types with <5% representation in the training set and note whether their anomaly rates differ from the fleet average.
+- **Geographic equity**: climate zone affects normal operating ranges. A model trained primarily on data from temperate zones may produce higher false positive rates for devices in tropical or arctic environments. Report anomaly rates by climate zone — if any zone's false positive rate is >2× the fleet average, the model is inequitable for that region.
+- **Customer tier impact**: if device monitoring quality varies by customer tier (e.g., enterprise customers have more complete sensor data, higher `sensor_completeness`), the model may be more accurate for well-instrumented devices and less sensitive for devices with sparser data. Report model performance metrics (maintenance lift, expert precision) by customer tier or data completeness quartile.
+- **Mitigation actions**: for each equity gap identified above, document planned or implemented mitigations (e.g., cohort-specific models for underrepresented device types, data augmentation for low-data regions, adjusted thresholds for low-completeness devices).
 
 ## Failure Modes
 - [Scenario where the model produces false positives]

@@ -195,6 +195,40 @@ If a device sends zero readings during a window period, no row is produced for t
 
 An alternative design (write a row with all nulls for missing windows) would create 100K × 96 = 9.6M rows/day from the 15-min window alone, most of which would be null rows for offline devices. The absent-row design keeps the dataset clean and storage efficient.
 
+**Distribution shift from connectivity variation**: the absent-row design means the number of rows per window varies with fleet connectivity. A 15-minute window during peak business hours may contain rows for 95K devices, while a window during a network outage may contain 60K. Models trained predominantly on high-connectivity windows may see distributional shift when scoring low-connectivity periods — the surviving devices during an outage may not be representative of the fleet. Monitor device coverage per window (count of distinct `device_id` values) and flag windows where coverage drops below 90% of the active fleet. When training, ensure the training set includes representative low-connectivity periods to avoid this bias.
+
+## Windowing and Temporal Train/Test Splits
+
+The window structure directly determines how temporal train/test splits must be implemented. Getting this wrong introduces data leakage that inflates evaluation metrics and produces models that underperform in production.
+
+### Correct Temporal Split
+
+Split `device_features` on `window_end` relative to a cutoff timestamp T:
+
+- **Training set**: all rows where `window_end <= T`
+- **Test set**: all rows where `window_start >= T`
+
+Note the asymmetry: train uses `window_end <= T` (the entire window's data was available before T), while test uses `window_start >= T` (the entire window's data comes from after T). This leaves a gap of windows that straddle T — those windows are excluded from both sets.
+
+### Why Random Splits Are Wrong
+
+Random train/test splits are invalid for windowed time series data for two reasons:
+
+1. **Autocorrelation**: adjacent windows for the same device are highly correlated. A device's 10:00 window is similar to its 10:15 window. If one lands in training and the other in test, the model is effectively tested on near-copies of its training data, producing artificially high scores.
+
+2. **Data leakage via lag features**: if a window at time T+1 is in the training set and a window at time T is in the test set, lag features computed at T+1 use values from T — meaning the model has seen the test example's features during training.
+
+### Gap Between Train and Test
+
+To fully prevent leakage from lag features and overlapping windows, insert a gap between the training and test periods equal to the largest window size plus the longest lag horizon. For this system:
+
+- Largest window: 1 day (1440 minutes)
+- Recommended gap: 1 day
+
+This means if the training cutoff is February 14 at 00:00 UTC, the test set starts no earlier than February 15 at 00:00 UTC. Any windows overlapping February 14 (e.g., a 1-day window from February 13 23:00 to February 14 23:00) are excluded from both sets.
+
+See [Feature Store — Point-in-Time Correctness](./feature-store.md) for how the feature store enforces temporal integrity, and [Time-Domain — Lag Features](./time-domain.md) for lag-specific leakage considerations.
+
 ## Multi-Resolution Detection
 
 The three window sizes complement each other for anomaly detection at different timescales:

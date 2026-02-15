@@ -24,6 +24,8 @@ Infrastructure monitoring is the foundation. If pipelines don't run, nothing dow
 | Dataset freshness | Latest transaction timestamp vs wall clock | Exceeds [contract SLA](../05-architecture/data-contracts.md) | Stale data propagates stale scores |
 | Dataset row count per build | Transaction metadata | Zero rows in a build that should always produce rows | Transform ran but produced nothing — logic bug or empty input |
 | Compute profile usage | Foundry cluster metrics | Consistent use of x-large when medium would suffice | Cost waste; or conversely, OOMs on small profiles |
+| Scoring latency (p50, p95, p99) | Build duration of scoring Transforms | p95 > 30 min for hourly scoring | Scoring that takes too long risks missing the next cycle; sustained high latency signals growing data or model complexity |
+| Scoring throughput | Devices scored per minute during batch scoring run | < 2,000 devices/min | Low throughput indicates compute profile is undersized or model inference is inefficient |
 
 ### Pipeline SLA Configuration
 
@@ -91,8 +93,8 @@ Compare current data distributions to a reference baseline (typically the traini
 
 | Metric | Computation | Alert Threshold |
 |---|---|---|
-| Sensor value distributions | Per-sensor histogram of values in `clean_sensor_readings`, compared to 30-day rolling baseline | KS test p-value < 0.01 sustained for 3+ consecutive windows |
-| Feature distributions | Per-feature histogram of values in `device_features` | Same KS test threshold |
+| Sensor value distributions | Per-sensor histogram of values in `clean_sensor_readings`, compared to 30-day rolling baseline | KS test p-value < 0.01 sustained for 3+ consecutive windows (hourly windows for fleet model, daily windows for cohort models) |
+| Feature distributions | Per-feature histogram of values in `device_features` | Same KS test threshold and window policy |
 | Null rate per sensor | Fraction of null values per sensor per hour | Change > 5 percentage points vs 7-day average |
 | quality_flag composition | Fraction of readings with each [quality flag](./data-quality.md#the-quality_flags-system) | Any flag category > 2× its 30-day average rate |
 | Sensor completeness distribution | Histogram of `sensor_completeness` values | Median drops below 0.8 |
@@ -120,6 +122,46 @@ def detect_feature_drift(current_features, baseline_stats):
     )
 
     return drift_metrics
+```
+
+### Drift Type Taxonomy
+
+Understanding *what* has drifted is as important as detecting *that* something drifted. Three types of distribution shift affect ML systems differently:
+
+| Drift Type | Definition | IoT/Refrigeration Example | Detection Difficulty |
+|---|---|---|---|
+| **Covariate shift** | Input feature distribution P(X) changes, but the relationship P(Y\|X) stays the same | Summer deployment shifts ambient temperature and humidity distributions, but the same sensor patterns still indicate compressor failure | Moderate — detectable via feature distribution monitoring (KS test, PSI) |
+| **Concept drift** | The relationship P(Y\|X) changes, even if input distributions stay the same | After a fleet-wide firmware update, the same vibration pattern that previously indicated bearing wear is now normal operating behavior | Hard — requires outcome labels. Primary signal is alert-to-maintenance hit rate declining over time |
+| **Label shift** | The prevalence of anomalies P(Y) changes, but the conditional P(X\|Y) stays the same | A batch of defective compressors enters the fleet, increasing the true anomaly rate from 5% to 12% | Moderate — detectable via anomaly rate monitoring, but distinguishing from model degradation requires maintenance feedback |
+
+**Why concept drift is the hardest to catch**: without ground-truth labels (which require maintenance feedback with multi-week lag), concept drift is invisible to input-only monitoring. The model's scores look normal, the input data looks normal, but the scores no longer mean what they used to. The best proxy signal is the alert-to-maintenance hit rate — if operators are increasingly marking alerts as false positives or if maintenance events are happening on devices the model scored as healthy, concept drift is likely.
+
+### Multi-Method Drift Detection
+
+The KS test is the primary univariate drift detection method, but it has limitations. Different statistical tests catch different types of distribution change. Use a suite of methods for comprehensive drift monitoring:
+
+| Method | Type | What It Detects | When to Use | Threshold |
+|---|---|---|---|---|
+| **Kolmogorov-Smirnov (KS) test** | Univariate, non-parametric | Any change in CDF shape (location, scale, modality) | Primary check on every continuous feature per scoring window | p-value < 0.01 sustained for 3+ consecutive windows |
+| **Population Stability Index (PSI)** | Univariate, binned | Magnitude of distribution shift relative to a reference | Periodic retrain eligibility checks (weekly/monthly) | PSI > 0.2 indicates significant shift requiring retraining |
+| **KL divergence** | Univariate, distribution-level | Asymmetric information-theoretic distance between distributions | Comparing score distributions across model versions (canary evaluation) | KL > 0.1 blocks model promotion |
+| **Chi-squared test** | Categorical | Changes in category proportions | Categorical features (`quality_flag` composition, device model distribution) | p-value < 0.01 for 3+ consecutive windows |
+| **Maximum Mean Discrepancy (MMD)** | Multivariate, kernel-based | Joint distribution shifts that univariate tests miss (e.g., correlation structure changes) | Supplementary check on the full feature vector when univariate tests are inconclusive | MMD statistic exceeds permutation-test threshold at α = 0.05 |
+
+**Recommended combination**: KS test as the primary per-feature check (fast, interpretable, already implemented). PSI as a periodic summary metric for retrain decisions. MMD as a supplementary multivariate check when multiple features show borderline KS results but none individually crosses the threshold — correlated shifts across features can be significant even when individual features look stable.
+
+```python
+def compute_psi(reference_dist, current_dist, bins=10):
+    """Population Stability Index between two distributions."""
+    ref_counts, bin_edges = np.histogram(reference_dist, bins=bins)
+    cur_counts, _ = np.histogram(current_dist, bins=bin_edges)
+
+    # Avoid division by zero with small epsilon
+    ref_pct = (ref_counts + 1e-6) / ref_counts.sum()
+    cur_pct = (cur_counts + 1e-6) / cur_counts.sum()
+
+    psi = np.sum((cur_pct - ref_pct) * np.log(cur_pct / ref_pct))
+    return psi
 ```
 
 ### Distinguishing Drift from Anomaly
@@ -163,6 +205,13 @@ The distribution of anomaly scores should be roughly stable over time. Sharp cha
 | Anomaly rate | Fraction of devices with `anomaly_flag = true` | ±3 percentage points from configured contamination rate (typically ~5%) | Rate too high: model or data problem. Rate too low: model may have gone stale. |
 | Score standard deviation | Stddev of `anomaly_score` per scoring run | Drop below 0.05 | Model is scoring everything similarly — may be collapsed |
 | Score percentile stability | 95th percentile of scores per run | Change > 0.1 from 30-day rolling p95 | The tail of the distribution is shifting |
+
+> **Slice-based monitoring**: aggregate metrics can hide slice-level degradation. A fleet-wide mean anomaly score may look stable while a specific device cohort or region experiences significant drift. Slice model monitoring metrics by:
+> - **Device cohort** (equipment model / manufacturer batch) — different hardware ages and degrades differently
+> - **Region** (geographic / climate zone) — seasonal effects vary by location
+> - **Equipment model** (product line / generation) — sensor characteristics differ across models
+>
+> If a slice's anomaly rate diverges from its own baseline by >3 percentage points while the fleet aggregate stays flat, investigate the slice independently. This is especially important after fleet expansions where new device cohorts may behave differently from the existing fleet.
 
 ### Model Agreement Rates
 

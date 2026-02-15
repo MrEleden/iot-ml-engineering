@@ -138,6 +138,8 @@ The streaming dataset exposes two views:
 
 The batch view of the streaming dataset _is_ the landing zone. It stores events exactly as received — no transformation, append-only. The schema matches [Contract 1](../05-architecture/data-contracts.md) (`raw_sensor_readings`).
 
+The batch view materializes in **Delta Lake format** (Parquet-backed, columnar storage). This matters for ML training workloads: training pipelines typically read a subset of columns (e.g., `device_id`, `timestamp_ingested`, and 2–3 sensor columns relevant to a specific model) rather than all 14 sensor fields. Parquet's columnar layout means these column-subset reads skip irrelevant columns entirely — at 100 GB/day raw volume, a training job reading 4 of 18 total columns scans roughly 20–25% of the data. Delta Lake adds ACID transactions and time travel on top of Parquet, enabling reproducible point-in-time reads for training dataset construction (see Continual Learning Support below).
+
 The landing zone is the system of record. Retained for a minimum of 90 days. No deletes or updates.
 
 ### End-to-End Latency Summary
@@ -205,6 +207,18 @@ The 2-minute freshness SLA on the landing zone ([Contract 1](../05-architecture/
 
 **Mitigation**: design downstream transforms to handle variable batch sizes — no hardcoded memory assumptions. See [Transform Patterns](../04-palantir/transform-patterns.md) for guidance on handling large incremental batches. Set Foundry pipeline SLA alerts on the landing zone dataset freshness.
 
+### Data Distribution Shift at Ingestion
+
+**What happens**: the statistical distribution of incoming sensor values changes without any pipeline failure. The pipeline continues running, schemas are valid, expectations pass — but the data itself has shifted. Examples: a regional heatwave raises ambient temperature readings fleet-wide; a firmware update changes sensor calibration causing a systematic offset in pressure readings; a subset of devices degrades gradually, shifting the vibration distribution upward.
+
+**How you detect it**: compute rolling statistics (mean, standard deviation, P5/P50/P95) per sensor on each hourly or daily batch of incoming data. Compare these statistics against a 30-day rolling baseline. Flag sensors where the current batch distribution deviates significantly from the baseline (e.g., mean shifts by more than 2σ of the baseline mean, or P95 exceeds the historical P99).
+
+**Why it matters**: distribution shift at ingestion is the earliest possible signal for model degradation. Anomaly detection models are trained on historical distributions. If the input distribution shifts and the model has not been retrained, detection accuracy degrades — false positives increase (the model flags normal-but-shifted readings as anomalous) or false negatives increase (the model's threshold no longer captures the new failure mode). Catching the shift at ingestion gives the team lead time to investigate before model performance visibly degrades.
+
+**Impact**: this is an **advisory signal**, not a pipeline-stopping event. A detected distribution shift does not halt ingestion or block downstream processing. It generates an alert for the data engineering and ML teams to investigate. The shift may be benign (seasonal change, expected firmware update) or indicative of a data quality problem (sensor calibration drift, device hardware degradation).
+
+**Implementation**: implement as a lightweight scheduled batch transform that runs daily (or hourly during known fleet events like firmware rollouts). The transform reads the latest landing zone partition, computes per-sensor statistics, compares against the 30-day baseline stored in an `ingestion_distribution_stats` dataset, and writes the results (sensor name, current stats, baseline stats, deviation magnitude, shift detected flag) back to that dataset. Alternatively, implement as a Foundry dataset expectation on the landing zone that computes summary statistics and warns (but does not fail the build) when thresholds are exceeded. The `ingestion_distribution_stats` dataset is consumed by the [Monitoring](../03-production/monitoring.md) layer for dashboarding and alerting.
+
 ## Capacity Planning
 
 ### Current Scale
@@ -243,6 +257,57 @@ The 2-minute freshness SLA on the landing zone ([Contract 1](../05-architecture/
 | Materialization interval | 5 minutes | Balances freshness (meets 2-min SLA with ≤5-min batch window) against transaction metadata overhead. See [Streaming Ingestion](../04-palantir/streaming-ingestion.md). |
 | Throughput tier | Medium–Large | Foundry-managed; request Large if consumer lag is sustained. |
 | Dead-letter monitoring | Alert > 0.1% of volume | Catches deserialization failures from firmware changes. |
+
+### Retention Strategy: Operational vs Training
+
+The landing zone serves two distinct consumers with different retention needs:
+
+**Hot tier (90 days) — Operational**
+
+The landing zone and its Delta Lake batch view retain 90 days of raw sensor readings. This supports:
+
+- Incremental processing by downstream cleansing and feature engineering transforms.
+- Debugging and incident investigation ("what did device X report around the time of the failure?").
+- Backfill reruns when a cleansing transform is updated and needs to reprocess recent history.
+- Freshness SLA monitoring and consumer lag recovery (Event Hubs retains 7 days; the landing zone extends this to 90).
+
+After 90 days, data is removed from the hot tier to bound storage costs and keep Delta Lake transaction logs manageable.
+
+**Cold tier (3+ years) — Training Archive**
+
+A training archive dataset stores historical sensor readings for long-term use. It is:
+
+- **Format**: Parquet files, columnar, partitioned by `date(timestamp_utc)` and `device_id`. Parquet is chosen over Delta Lake for the cold tier because the archive is append-only and never updated — Delta Lake's ACID transaction overhead is unnecessary.
+- **Schema**: identical to Contract 1 (`raw_sensor_readings`). No transformation applied.
+- **Population**: a scheduled batch transform snapshots the landing zone weekly, appending the most recent 7 days of data to the archive. The transform is idempotent — re-running it for an already-archived date range produces no duplicates (deduplicated on `event_id`).
+- **Append-only**: no deletes or updates. Once data enters the archive, it is immutable.
+
+The cold archive supports:
+
+- **Seasonal retraining**: anomaly detection models must be retrained on data spanning multiple seasons (summer vs. winter operating profiles). 90 days is insufficient; 12–24 months is the minimum for a single full seasonal cycle.
+- **Evaluation backtesting**: new model versions are evaluated against historical data to measure whether they improve on previous versions. This requires years of labeled ground-truth data.
+- **Regulatory audit**: some jurisdictions require retention of equipment monitoring data for 3+ years. The cold archive satisfies this without burdening the operational hot tier.
+
+### Continual Learning Support: Dataset Snapshots
+
+Models are retrained periodically on updated data. Reproducing a training run requires knowing exactly which data the model was trained on. Delta Lake's time travel capabilities provide this without maintaining separate snapshot copies.
+
+**How it works**:
+
+- The landing zone (hot tier) is stored as a Delta Lake table. Every write creates a new Delta version.
+- Training pipelines query the landing zone using `VERSION AS OF <version>` or `TIMESTAMP AS OF <timestamp>` to read a consistent, point-in-time snapshot of the data.
+- The Delta version number (or commit timestamp) is recorded as metadata alongside each training run in the experiment tracker. To reproduce the run, re-read the same Delta version.
+
+**Retention policy for time travel**:
+
+- Delta Lake's `delta.deletedFileRetentionDuration` is set to `90 days` on the landing zone, matching the hot tier retention. This means any Delta version created within the past 90 days can be read via time travel.
+- For snapshots older than 90 days, the training archive (cold tier) is the fallback. The archive does not support Delta time travel (it is plain Parquet), but it is append-only and immutable — any date range that was archived can be queried deterministically by partition.
+
+**Snapshot key: `timestamp_ingested`, not `timestamp_device`**:
+
+- When constructing a training dataset, filter on `timestamp_ingested` (the server-side receive time from IoT Hub) rather than `timestamp_device` (the device-reported time).
+- `timestamp_device` reflects when the device claims the reading occurred. Devices with clock drift, buffered readings, or reconnection replays can produce `timestamp_device` values that are hours or days in the past. Filtering on `timestamp_device` can pull in data that was not actually available at the time the model would have run in production — this is temporal leakage.
+- `timestamp_ingested` reflects when the data entered the pipeline and became available for processing. It is the correct proxy for "data availability" and prevents leakage in point-in-time training splits.
 
 ### Growth Considerations
 

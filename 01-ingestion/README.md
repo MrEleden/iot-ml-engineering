@@ -27,7 +27,12 @@ The ingestion pipeline is the leftmost boundary of the system. It is governed by
 - **Contract 1 (Raw → Landing Zone)**: append-only, no transformation, system of record
 - **Contract 2 (Landing Zone → Clean)**: deduplicated, range-validated, timezone-normalized
 
-Everything downstream — feature engineering, model scoring, alerting — depends on the guarantees established here. If ingestion breaks, the entire pipeline breaks.
+Everything downstream depends on the guarantees established here. The landing zone serves two distinct downstream consumer patterns:
+
+- **Operational inference**: incremental consumption of new data transactions, governed by freshness SLAs (≤ 2 min for the landing zone, ≤ 15 min for the clean dataset). Cleansing, feature engineering, and model scoring transforms consume data this way.
+- **Model training**: bulk historical reads over months of data, requiring retention (90-day hot tier, 3+ year cold archive) and reproducible point-in-time snapshots via Delta Lake time travel. Training pipelines read from the same landing zone and training archive datasets but with fundamentally different access patterns — range queries over historical partitions rather than incremental transaction consumption.
+
+If ingestion breaks, both consumer patterns break.
 
 ## Key Numbers
 
@@ -39,6 +44,10 @@ Everything downstream — feature engineering, model scoring, alerting — depen
 | Fleet throughput | ~14M readings/min |
 | Landing zone freshness SLA | ≤ 2 min from IoT Hub receipt |
 | Clean dataset freshness SLA | ≤ 15 min from landing zone append |
+| Landing zone retention (hot) | 90 days |
+| Training archive retention (cold) | 3+ years |
+| Point-in-time snapshot support | Delta Lake time travel (`VERSION AS OF` / `TIMESTAMP AS OF`) |
+| Historical query partitioning | By date (`timestamp_utc`) |
 
 ## Related Sections
 

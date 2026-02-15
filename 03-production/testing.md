@@ -429,6 +429,71 @@ def test_device_alerts_schema(spark):
 
 Define contract schemas as Python `StructType` objects in a shared module (`schemas.py`), derived from the column tables in [data-contracts.md](../05-architecture/data-contracts.md). This is a manual synchronization — if a contract changes, the schema definition and the doc must both be updated. A CI check that the two are in sync is ideal but non-trivial; in practice, treat the markdown as authoritative and the Python schema as a tested copy.
 
+## Data Distribution Assumption Tests
+
+Schema tests validate structure. Distribution tests validate that the data the model is scoring still resembles the data it was trained on. These tests compare current feature statistics against the training-time statistics stored alongside the model (see [Training-Serving Skew Detection](./data-quality.md#training-serving-skew-detection)).
+
+```python
+def test_feature_distributions_within_training_bounds(spark):
+    """Current feature means should be within 2 stddevs of training means.
+    If multiple features drift simultaneously, the model is operating
+    outside its training distribution."""
+    current_features = load_latest_features(spark)  # latest scoring window
+    training_stats = load_training_statistics(spark, model_id="isolation_forest_v2")
+
+    training_stats_pd = training_stats.toPandas().set_index("feature_name")
+    current_stats_pd = (
+        current_features
+        .select([F.mean(c).alias(c) for c in training_stats_pd.index])
+        .toPandas()
+        .iloc[0]
+    )
+
+    drifted_features = []
+    for feature_name in training_stats_pd.index:
+        training_mean = training_stats_pd.loc[feature_name, "training_mean"]
+        training_stddev = training_stats_pd.loc[feature_name, "training_stddev"]
+        current_mean = current_stats_pd[feature_name]
+
+        if training_stddev > 0:
+            z_score = abs(current_mean - training_mean) / training_stddev
+            if z_score > 2.0:
+                drifted_features.append(
+                    f"{feature_name}: z={z_score:.2f} "
+                    f"(current={current_mean:.4f}, training={training_mean:.4f})"
+                )
+
+    assert len(drifted_features) <= 3, (
+        f"{len(drifted_features)} features drifted beyond 2 stddevs of training mean:\n"
+        + "\n".join(drifted_features)
+    )
+
+
+def test_feature_ranges_not_expanding(spark):
+    """No more than 10% of values should fall outside the training range."""
+    current_features = load_latest_features(spark)
+    training_stats = load_training_statistics(spark, model_id="isolation_forest_v2")
+
+    training_stats_pd = training_stats.toPandas().set_index("feature_name")
+    total_rows = current_features.count()
+
+    for feature_name in training_stats_pd.index:
+        t_min = training_stats_pd.loc[feature_name, "training_min"]
+        t_max = training_stats_pd.loc[feature_name, "training_max"]
+
+        out_of_range = current_features.filter(
+            (F.col(feature_name) < t_min) | (F.col(feature_name) > t_max)
+        ).count()
+
+        fraction_outside = out_of_range / total_rows if total_rows > 0 else 0
+        assert fraction_outside <= 0.10, (
+            f"{feature_name}: {fraction_outside:.1%} of values outside "
+            f"training range [{t_min}, {t_max}]"
+        )
+```
+
+These tests run in CI against the regression test dataset and can also be scheduled as a post-scoring validation step in production.
+
 ## Model-Specific Tests
 
 ### Determinism
@@ -482,6 +547,89 @@ def test_extreme_values_within_range(spark):
         (F.col("anomaly_score") < 0) | (F.col("anomaly_score") > 1)
     ).count()
     assert out_of_range == 0, "Scores must be in [0, 1]"
+```
+
+### Fallback System Tests
+
+The [rules-based fallback](./model-serving.md#rules-based-fallback) is the safety net when ML models are unavailable. If the fallback itself is buggy, the system has no last line of defense. These tests validate that the fallback catches obvious anomalies, does not flag normal devices, and activates correctly when scores go stale.
+
+```python
+def test_rules_fallback_catches_obvious_anomaly(spark):
+    """Fallback rules should flag a device with clearly anomalous readings."""
+    anomalous_features = spark.createDataFrame([{
+        "device_id": "REF-TEST-00001",
+        "window_start": datetime(2026, 1, 15, 10, 0),
+        "window_end": datetime(2026, 1, 15, 10, 15),
+        "temp_evaporator_mean": 5.0,          # above freezing — should trigger
+        "vibration_compressor_max": 25.0,      # extreme vibration — should trigger
+        "pressure_low_mean": 80.0,             # dangerously low — should trigger
+        "current_compressor_max": 38.0,        # near overload — should trigger
+        "sensor_completeness": 0.9,
+    }])
+
+    result = rules_based_fallback(anomalous_features)
+    row = result.collect()[0]
+    assert row["anomaly_flag"] is True, (
+        "Fallback should flag device with extreme evaporator temp, "
+        "vibration, low pressure, and high current"
+    )
+
+
+def test_rules_fallback_does_not_flag_normal(spark):
+    """Fallback rules should not flag a device with normal readings."""
+    normal_features = spark.createDataFrame([{
+        "device_id": "REF-TEST-00002",
+        "window_start": datetime(2026, 1, 15, 10, 0),
+        "window_end": datetime(2026, 1, 15, 10, 15),
+        "temp_evaporator_mean": -22.0,         # normal
+        "vibration_compressor_max": 4.0,        # normal
+        "pressure_low_mean": 210.0,             # normal
+        "current_compressor_max": 14.0,         # normal
+        "sensor_completeness": 0.95,
+    }])
+
+    result = rules_based_fallback(normal_features)
+    row = result.collect()[0]
+    assert row["anomaly_flag"] is False, (
+        "Fallback should not flag device with all normal sensor readings"
+    )
+
+
+def test_staleness_triggers_fallback(spark):
+    """When scores exceed the staleness threshold, the system should
+    switch to rules-based fallback."""
+    from datetime import datetime, timedelta
+
+    stale_scores = spark.createDataFrame([{
+        "device_id": "REF-TEST-00003",
+        "anomaly_score": 0.3,
+        "anomaly_flag": False,
+        "scored_at": datetime.utcnow() - timedelta(hours=3),  # 3 hours old
+    }])
+
+    staleness_hours = (
+        (datetime.utcnow() - stale_scores.collect()[0]["scored_at"])
+        .total_seconds() / 3600
+    )
+    assert staleness_hours > 2.0, "Scores should be detected as stale (>2h)"
+
+    # When stale, system should use fallback instead of stale ML scores
+    features = spark.createDataFrame([{
+        "device_id": "REF-TEST-00003",
+        "window_start": datetime(2026, 1, 15, 10, 0),
+        "window_end": datetime(2026, 1, 15, 10, 15),
+        "temp_evaporator_mean": 5.0,           # anomalous
+        "vibration_compressor_max": 25.0,
+        "pressure_low_mean": 80.0,
+        "current_compressor_max": 38.0,
+        "sensor_completeness": 0.9,
+    }])
+
+    fallback_result = rules_based_fallback(features)
+    row = fallback_result.collect()[0]
+    assert row["anomaly_flag"] is True, (
+        "Fallback should catch obvious anomaly when ML scores are stale"
+    )
 ```
 
 ## Regression Testing
@@ -590,6 +738,103 @@ feature/add-vibration-feature
 ### CI Timing Constraint
 
 All CI checks should complete in under 5 minutes. Slow CI encourages developers to skip running it. The biggest risk is Spark startup time — use the local Spark session approach (one session per test suite, not per test) and keep test datasets small (100–1,000 rows, not 100K).
+
+## Infrastructure Tests
+
+A model can pass every unit test, schema test, and regression test and still fail in production because of infrastructure problems. Infrastructure tests validate that the serving environment is correctly configured before a model runs.
+
+### Why Infrastructure Tests Matter
+
+The most common production failures are not model bugs — they are environment issues: the model artifact can't be loaded, an input dataset doesn't exist or isn't accessible, the compute profile is too small, or a Python dependency is missing. These failures happen at deploy time, not development time, and are invisible to unit tests that run in a local Spark session.
+
+### Infrastructure Test Suite
+
+```python
+def test_model_loads_successfully():
+    """Model artifact can be deserialized without errors."""
+    from palantir_models.transforms import ModelInput
+
+    model = ModelInput("/Company/models/refrigeration/isolation_forest")
+    assert model is not None, "Model artifact failed to load"
+    # Verify model has expected interface
+    assert hasattr(model, "transform"), "Model must expose transform() method"
+
+
+def test_input_dataset_accessible(spark):
+    """Scoring Transform can read from the input feature dataset."""
+    features = spark.read.format("foundry").load(
+        "/Company/pipelines/refrigeration/features/device_features"
+    )
+    assert features.count() > 0, "Feature dataset is empty or inaccessible"
+    # Verify expected columns exist
+    required_cols = ["device_id", "window_end", "sensor_completeness"]
+    for col in required_cols:
+        assert col in features.columns, f"Missing required column: {col}"
+
+
+def test_output_dataset_writable(spark):
+    """Scoring Transform can write to the output scores dataset."""
+    test_row = spark.createDataFrame([{
+        "device_id": "INFRA-TEST-00001",
+        "anomaly_score": 0.5,
+        "anomaly_flag": False,
+        "model_id": "infrastructure_test",
+        "scored_at": datetime.utcnow(),
+    }])
+    # Attempt write to a test partition (will be cleaned up)
+    try:
+        test_row.write.format("foundry").mode("append").save(
+            "/Company/test-resources/test-data/infra_test_output"
+        )
+    except Exception as e:
+        pytest.fail(f"Cannot write to output dataset: {e}")
+
+
+def test_compute_profile_adequate(spark):
+    """Compute profile has enough memory for expected data volume."""
+    features = spark.read.format("foundry").load(
+        "/Company/pipelines/refrigeration/features/device_features"
+    )
+    latest_window = features.agg(F.max("window_end")).collect()[0][0]
+    current_features = features.filter(F.col("window_end") == latest_window)
+    device_count = current_features.count()
+
+    # Pandas conversion is the memory bottleneck — estimate required memory
+    estimated_memory_mb = device_count * 50 * 8 / (1024 * 1024)  # 50 features, 8 bytes each
+    # Driver should have at least 2x the estimated memory for overhead
+    assert estimated_memory_mb < 8000, (
+        f"Estimated Pandas memory ({estimated_memory_mb:.0f} MB) may exceed "
+        f"driver capacity. Consider Spark UDF-based inference or larger profile."
+    )
+
+
+def test_dependency_availability():
+    """Required Python packages are importable."""
+    required_packages = [
+        "sklearn",          # Isolation Forest
+        "numpy",            # Numerical operations
+        "pandas",           # Model adapter interface
+        "pyspark",          # Spark operations
+        "joblib",           # Model serialization
+    ]
+    missing = []
+    for package in required_packages:
+        try:
+            __import__(package)
+        except ImportError:
+            missing.append(package)
+
+    assert len(missing) == 0, f"Missing required packages: {missing}"
+```
+
+### When to Run Infrastructure Tests
+
+| Trigger | Rationale |
+|---|---|
+| Before every production deployment | Catch environment issues before they affect scoring |
+| After compute profile changes | Verify new profile has adequate resources |
+| After Foundry platform upgrades | Platform changes can affect dataset access or model loading |
+| After dependency version updates | New package versions may break model serialization |
 
 ## Cross-References
 

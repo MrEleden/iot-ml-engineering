@@ -41,6 +41,14 @@ flowchart LR
             ONT[Ontology Actions]
             DASH[Workshop Dashboard]
         end
+
+        subgraph Train["Training & Retraining"]
+            TDA[Training Data Assembly]
+            MT[Model Training]
+            MR[Model Registry]
+        end
+
+        MON[Monitoring]
     end
 
     IoT --> EH --> SD --> LZ
@@ -48,6 +56,14 @@ flowchart LR
     FE --> OFF --> BATCH --> ALERT --> DASH
     FE --> ON --> STREAM --> ONT --> DASH
     OFF --> ON
+    OFF --> TDA --> MT --> MR --> BATCH
+
+    ALERT -.->|Outcome Labeling| TDA
+
+    BATCH --> MON
+    STREAM --> MON
+    FE --> MON
+    CL --> MON
 ```
 
 ## Component Responsibilities
@@ -98,6 +114,14 @@ See [ADR-002](./adr-002-batch-plus-streaming.md) for detailed rationale on the h
 | **Ontology Actions** | Trigger work orders, escalations, or automated responses based on anomaly severity. Operates within a **Site** hierarchy — alerts are aggregated by site for regional operations teams. See [Ontology Design](../04-palantir/ontology-design.md) for the Site object type and site-level aggregation patterns. | Action execution failure → retry queue. If retries exhausted, falls back to alert-only (human must act). |
 | **Workshop Dashboard** | Operational visibility: fleet health, anomaly trends, device drill-down. | Dashboard is read-only — failure here doesn't affect detection or alerting. |
 
+### Model Lifecycle
+
+| Component | Responsibility | Failure Mode |
+|-----------|---------------|---------------|
+| **Model Registry** | Stores versioned model artifacts with associated metadata (feature lists, training data snapshot, hyperparameters, evaluation metrics). Ensures that batch and streaming scoring always reference a known, validated model version. | Registry corruption or unavailability → scoring falls back to the last known good model version. Mitigated by immutable artifact storage and version pinning per scoring job. |
+| **Training Pipeline** | Orchestrates offline training runs: assembles point-in-time correct training data from the offline feature store, trains all model families (statistical, Isolation Forest, Autoencoder), evaluates against held-out windows, and promotes passing models to the registry. Runs on a configurable schedule (default monthly) or on-demand when drift detection triggers retraining. | Training failure → current production model continues scoring unchanged. Silent degradation if retraining is skipped too long — mitigated by drift monitoring alerts. |
+| **Monitoring** | Tracks pipeline health (latency, throughput, error rates) and model health (score distributions, feature drift, alert volumes) across all stages. Publishes metrics to Foundry dashboards and triggers alerts when SLA thresholds or drift thresholds are breached. | Monitoring failure is non-blocking — pipeline continues operating. Gap in observability mitigated by redundant health checks at each pipeline stage. |
+
 ## Latency Budget
 
 The 12–24 hour lead time for failure prediction gives us a generous latency budget for batch scoring. Streaming scoring targets sub-minute latency for acute anomalies (e.g., sudden compressor current spike).
@@ -114,6 +138,17 @@ The 12–24 hour lead time for failure prediction gives us a generous latency bu
 | End-to-end (streaming path) | < 2 minutes | For urgent anomalies only (threshold + lightweight model) |
 
 These are targets, not SLAs. Actual latency depends on Foundry cluster load and Spark job queuing. See [Data Contracts](./data-contracts.md) for formal freshness guarantees.
+
+## Adaptability
+
+Sensor distributions shift over time due to seasonal variation, equipment aging, firmware updates, and operational changes. The system handles these shifts through several mechanisms:
+
+- **Retraining cadence.** Statistical and tree-based models are retrained monthly using a rolling 90-day training window. Autoencoders are retrained quarterly due to higher compute cost. Each retraining cycle uses point-in-time correct feature snapshots from the offline feature store to prevent data leakage.
+- **Drift detection triggers.** Between scheduled retraining runs, automated drift monitoring compares live feature distributions against the training baseline using Population Stability Index (PSI) and anomaly score distribution divergence (KL-divergence). If PSI exceeds 0.2 for any feature group or KL-divergence on the score distribution exceeds a configured threshold, an on-demand retraining is triggered. See [Data Quality & Monitoring](../03-production/monitoring.md) for metric definitions.
+- **Automated threshold updates.** Anomaly score thresholds used for alert classification are not static — they are recalculated after each retraining cycle based on the new model's score distribution on a held-out validation set. Updated thresholds are written to the Ontology as device or cohort properties, where they are consumed by both batch and streaming scoring paths.
+- **Seasonal feature baselines.** Features that exhibit strong seasonal patterns (e.g., ambient temperature, humidity) include seasonal covariates (day-of-year, ambient temperature rolling baseline) to prevent seasonal shifts from appearing as anomalies. Baseline profiles are updated monthly alongside model retraining.
+
+This combination of scheduled retraining, automated drift-triggered retraining, and dynamic threshold updates ensures the system remains calibrated as fleet behavior evolves.
 
 ## Data Volume Estimates
 

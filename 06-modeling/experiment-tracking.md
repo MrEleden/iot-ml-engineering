@@ -92,6 +92,8 @@ Together, code version + data version + config version = full reproducibility. R
 | `python_env_version` | `string` | Python runtime version (e.g., `3.9.16`). |
 | `key_dependencies` | `string` | JSON-serialized dict of critical package versions (`{"scikit-learn": "1.3.0", "torch": "2.0.1"}`). |
 | `model_artifact_rid` | `string` | Foundry resource ID of the published model artifact. Null if experiment was not published. |
+| `training_data_stats` | `string` | JSON-serialized per-feature summary statistics of the training data (mean, std, min, max, p25, p50, p75, skewness, kurtosis for each feature). Used for drift detection at scoring time — the scoring pipeline compares current feature distributions against these baseline statistics. Also records KS test results from subsample validation (see [Training Pipeline](./training-pipeline.md), Sampling Strategy). |
+| `exclusion_summary` | `string` | JSON-serialized summary of rows excluded per criterion during training data construction. Keys: `low_completeness_count`, `low_reading_count`, `known_outage_count`, `high_quality_flags_count`, `post_maintenance_count`, `iterative_cleaning_count`, `total_excluded`, `total_before_exclusion`, `exclusion_fraction`. Provides an audit trail of how much data was discarded and why — if `exclusion_fraction` exceeds 0.20, investigate whether exclusion criteria are too aggressive. |
 | `status` | `string` | One of: `completed`, `failed`, `promoted`. |
 | `promoted_at` | `timestamp` | Null until the experiment is promoted to production. |
 | `notes` | `string` | Free-text notes from the ML Scientist. Why was this experiment run? What was the hypothesis? |
@@ -133,6 +135,11 @@ Every experiment must log these metrics (model-type-specific metrics are in addi
 | `noise_fraction` | Fraction of devices not assigned to any cluster | DBSCAN |
 | `average_path_length_normal` | Mean path length for devices below threshold | Isolation Forest |
 | `average_path_length_anomalous` | Mean path length for devices above threshold | Isolation Forest |
+| `loss_epoch_{n}` | Training loss at epoch n (log for each epoch) | Autoencoder |
+| `val_loss_epoch_{n}` | Validation loss at epoch n (log for each epoch) | Autoencoder |
+| `model_artifact_size_bytes` | Size of the serialized model artifact in bytes. Track to detect model bloat across retraining cycles and to estimate storage costs at scale (100K per-device models × artifact size = total storage). | All |
+| `scoring_latency_p50_ms` | Median scoring latency per device on the validation set. Measured as wall-clock time to score one device's feature vector (excluding I/O). Target: <10ms for Isolation Forest, <50ms for Autoencoder. | All |
+| `scoring_latency_p99_ms` | 99th percentile scoring latency per device. Captures tail latency from outlier feature vectors or garbage collection pauses. If p99 exceeds 5× p50, investigate model complexity or input data issues. | All |
 
 ---
 

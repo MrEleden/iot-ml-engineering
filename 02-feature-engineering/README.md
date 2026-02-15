@@ -38,6 +38,29 @@ Every feature in this section exists because it captures a specific physical beh
 
 Start with [Windowing Strategies](./windowing.md) to understand how raw readings become window-level rows. Then read [Time-Domain](./time-domain.md) and [Cross-Sensor](./cross-sensor.md) for the core features. [Frequency-Domain](./frequency-domain.md) covers a specialized (and limited) subset. Finish with [Feature Store](./feature-store.md) for how features are stored and served.
 
+## Feature Quality Criteria
+
+Every candidate feature must pass four criteria before inclusion in the production schema:
+
+| Criterion | Description |
+|-----------|-------------|
+| **Predictive** | The feature must carry signal relevant to anomaly detection. Validate via permutation importance (Isolation Forest) or reconstruction error contribution (Autoencoder). A feature that does not change anomaly rankings when shuffled adds dimensionality without value. |
+| **Available at serving time** | The feature must be computable from data available when the model scores — no future-looking joins, no labels, no data that arrives after the prediction window closes. See [Feature Store — Point-in-Time Correctness](./feature-store.md). |
+| **Computable fast enough** | The feature must be computable within the pipeline's latency budget: 30 minutes for batch features ([Contract 3 SLA](../05-architecture/data-contracts.md)). Features requiring expensive operations (e.g., fleet-wide joins, iterative algorithms) must be profiled at 100K-device scale before promotion. |
+| **Generalizable** | The feature must work across equipment models, seasons, and geographic regions — not just the subset used during development. Validate on held-out cohorts spanning different equipment types and time periods. See [Cross-Sensor — Feature Generalization](./cross-sensor.md). |
+
+## Cross-Cutting Concerns
+
+Several concerns span multiple feature engineering documents. The table below provides a quick reference to where each is addressed and its key principle.
+
+| Concern | Where Addressed | Key Principle |
+|---------|----------------|---------------|
+| Data leakage prevention | [Time-Domain — Lag Features](./time-domain.md), [Windowing — Temporal Splits](./windowing.md), [Feature Store — Point-in-Time Correctness](./feature-store.md) | Features must never use data from after the prediction window. Scale and normalize using training-partition statistics only. |
+| Feature scaling | [Time-Domain — Feature Scaling Considerations](./time-domain.md) | Store unscaled in feature store. Apply z-score standardization at model-input time, fit on training partition only. |
+| Distribution monitoring | [Time-Domain — Feature Distribution Monitoring](./time-domain.md), [Feature Store — Feature Distribution Monitoring](./feature-store.md), [Cross-Sensor — Covariate Shift Monitoring](./cross-sensor.md) | Track per-feature PSI against training reference. PSI > 0.25 triggers retraining evaluation. |
+| Feature importance validation | [Time-Domain — Feature Importance Validation](./time-domain.md) | Validate via permutation importance or reconstruction error. Joint responsibility between Feature Engineer and ML Scientist. |
+| Null handling | [Time-Domain — Null behavior](./time-domain.md), [Windowing — Empty Windows](./windowing.md), [Feature Store — Null Fraction Escalation](./feature-store.md) | Nulls propagate honestly (no silent imputation in feature store). Downstream models apply their own null strategy. Rising null fractions escalate to Data Engineer. |
+
 ## Output Schema Reference
 
 All feature names in these docs align with the `device_features` schema defined in [Contract 3](../05-architecture/data-contracts.md). The naming convention is:

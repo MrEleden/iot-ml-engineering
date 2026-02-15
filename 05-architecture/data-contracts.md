@@ -191,6 +191,78 @@ Pattern: `{sensor_short}_{aggregation}` where:
 | Window alignment | All windows aligned to clock boundaries (e.g., 15-min windows start at :00, :15, :30, :45) |
 | Null policy | Feature is null only when **all** underlying readings in the window are null for that sensor. Partial data → compute on available readings. |
 
+### Feature Baselines
+
+Each feature in the `device_features` dataset must have a companion baseline profile stored in a separate `feature_baselines` dataset. Baselines are computed from the model training window and updated on every retraining cycle.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `feature_name` | `string` | Name of the feature (matches column name in `device_features`). |
+| `granularity` | `string` | Baseline scope: `fleet`, `cohort`, or `device`. |
+| `cohort_id` | `string` | Cohort identifier (null for fleet-level baselines). |
+| `device_id` | `string` | Device identifier (null for fleet/cohort-level baselines). |
+| `baseline_mean` | `double` | Mean value across the training window. |
+| `baseline_std` | `double` | Standard deviation across the training window. |
+| `baseline_p05` | `double` | 5th percentile. |
+| `baseline_p25` | `double` | 25th percentile. |
+| `baseline_p50` | `double` | Median. |
+| `baseline_p75` | `double` | 75th percentile. |
+| `baseline_p95` | `double` | 95th percentile. |
+| `computed_at` | `timestamp` | When this baseline was computed. |
+| `training_window_start` | `timestamp` | Start of the data window used to compute the baseline. |
+| `training_window_end` | `timestamp` | End of the data window used to compute the baseline. |
+
+Baseline profiles serve two purposes: (1) drift detection — live feature distributions are compared against baselines using PSI to detect distribution shifts, and (2) feature normalization — autoencoders normalize input features using baseline mean and std.
+
+---
+
+## Contract 3.5: Feature Store → Training Data Assembly
+
+Training data is assembled from the offline feature store with strict point-in-time semantics. This contract governs how historical features are joined with label data (or pseudo-labels from anomaly detections) to produce training datasets.
+
+### Schema: `training_data`
+
+| Column | Type | Nullable | Description |
+|--------|------|----------|-------------|
+| `device_id` | `string` | No | Device identifier. |
+| `window_start` | `timestamp` | No | Feature window start (UTC). |
+| `window_end` | `timestamp` | No | Feature window end (UTC). |
+| `window_duration_minutes` | `integer` | No | Window length (15, 60, or 1440). |
+| `feature_vector` | `array<double>` | No | Ordered feature values as of the feature window. |
+| `feature_names` | `array<string>` | No | Column names corresponding to each position in `feature_vector`. |
+| `label` | `string` | Yes | Label value if available: `normal`, `pre_failure`, `anomaly_confirmed`, `false_positive`. Null for unlabeled windows (Phase 1 default). |
+| `label_source` | `string` | Yes | Origin of the label: `field_engineer`, `maintenance_record`, `pseudo_label`, `heuristic`. Null if unlabeled. |
+| `label_timestamp` | `timestamp` | Yes | When the label event occurred. Must be strictly after `window_end` + `label_delay_buffer`. |
+| `label_delay_buffer_hours` | `integer` | No | Configurable buffer (default: 24 hours) ensuring features precede the label event by at least this duration. Prevents data leakage. |
+| `snapshot_id` | `string` | No | Delta Lake version or snapshot identifier of the feature store at the time of training data assembly. Enables exact reproducibility. |
+| `sensor_completeness` | `double` | No | From feature store. Training rows with completeness below 0.5 are excluded by default. |
+| `assembled_at` | `timestamp` | No | When this training row was assembled. |
+
+### Point-in-Time Join Semantics
+
+Training data assembly uses point-in-time joins to prevent label leakage:
+
+- For each label event (e.g., confirmed failure at time `T`), features are selected from all windows where `window_end < T - label_delay_buffer`.
+- The `label_delay_buffer` (default 24 hours) ensures that features used for training could not have been influenced by knowledge of the outcome.
+- Features are read from a specific Delta Lake snapshot (`snapshot_id`) to ensure that retroactive feature corrections do not silently alter training data.
+
+### Data Versioning
+
+Every training dataset is pinned to a Delta Lake snapshot of the `device_features` dataset. The `snapshot_id` is recorded per training run and stored alongside the trained model artifact in the model registry. This enables:
+
+- **Reproducibility**: re-running training with the same `snapshot_id` produces identical training data.
+- **Auditability**: for any production model, the exact feature data it was trained on can be reconstructed.
+- **Rollback**: if a feature engineering bug is discovered, models trained on affected snapshots can be identified and reverted.
+
+### SLA
+
+| Guarantee | Target |
+|-----------|--------|
+| Freshness | Training data assembled within **2 hours** of label data update |
+| Point-in-time correctness | 100% of training rows satisfy `window_end < label_timestamp - label_delay_buffer` |
+| Snapshot reproducibility | Re-assembly from the same `snapshot_id` produces byte-identical output |
+| Minimum completeness | Training rows with `sensor_completeness < 0.5` are excluded |
+
 ---
 
 ## Contract 4: Feature Store → Model Input
@@ -217,6 +289,16 @@ Model input is a view over the feature store, scoped to the features each model 
 - **Deep learning models** (Autoencoder): use all numeric features, normalized to [0,1] range
 
 Feature selection is defined per model in model metadata, not hardcoded in the pipeline. This allows adding or removing features without changing the scoring transform.
+
+### Point-in-Time Correctness
+
+For training use, features consumed via the `model_input` schema must satisfy point-in-time constraints: `window_end` must precede the label event timestamp by a configurable buffer (default 24 hours). This prevents data leakage where features computed after (or concurrently with) a failure event are used to train a model that predicts that failure. The buffer duration is stored per model in model metadata and enforced during training data assembly (see [Contract 3.5](#contract-35-feature-store--training-data-assembly)).
+
+### Imputation Strategy
+
+Null values in `feature_vector` are not permitted (see SLA below). The default imputation method for null features is **forward-fill from the device's most recent non-null value within the same window duration**, falling back to the **cohort median** if no device history is available. If both fail, the row is excluded from scoring.
+
+The imputation method applied to each feature must be recorded in model metadata alongside the feature list. This ensures that inference-time imputation is identical to training-time imputation. Any change to the imputation strategy requires model retraining.
 
 ### SLA
 
@@ -344,6 +426,47 @@ Never change a column type in-place. Instead:
 ### Enforcing Contracts
 
 All contracts are enforced via Foundry dataset expectations. Expectations run as part of the transform and will fail the build if violated. See [Data Quality & Monitoring](../03-production/data-quality.md) for expectation patterns.
+
+---
+
+## Contract 7: Label Data (Phase 2 Placeholder)
+
+This contract defines the schema for labeled outcome data used to train supervised models in Phase 2. During Phase 1, labels are accumulated organically as field engineers confirm or reject anomaly detections. This contract is a placeholder — the schema is defined but the pipeline is not yet automated.
+
+### Schema: `label_events`
+
+| Column | Type | Nullable | Description |
+|--------|------|----------|-------------|
+| `device_id` | `string` | No | Device that the label applies to. |
+| `event_timestamp` | `timestamp` | No | When the labeled event occurred (e.g., confirmed failure time, maintenance visit time). |
+| `label_type` | `string` | No | Category of the label: `failure_confirmed`, `anomaly_confirmed`, `false_positive`, `planned_maintenance`, `normal_operation`. |
+| `label_source` | `string` | No | Origin of the label: `field_engineer`, `maintenance_system`, `operator_feedback`, `automated_heuristic`. |
+| `label_confidence` | `double` | No | Confidence in the label accuracy (0.0–1.0). `field_engineer` labels default to 0.9. `automated_heuristic` labels default to 0.5. |
+| `labeled_at` | `timestamp` | No | When the label was created or recorded. Distinct from `event_timestamp` — labels may be applied days after the event. |
+| `alert_id` | `string` | Yes | If this label was created in response to a specific alert, the alert ID. Enables join back to the alert and its associated model scores. |
+| `failure_mode` | `string` | Yes | Free-text or enumerated failure mode (e.g., `compressor_seizure`, `refrigerant_leak`, `fan_motor_failure`). Null if not a failure event. |
+| `notes` | `string` | Yes | Free-text notes from the labeler. |
+
+### Phase 2 Activation Criteria
+
+This contract moves from placeholder to active when the following criteria are met:
+
+- Minimum 1,000 labeled events across at least 500 distinct devices
+- At least 100 confirmed failure events (positive labels)
+- Label quality: ≥ 80% of labels have `label_confidence` ≥ 0.7
+- At least 3 months of temporal coverage to capture seasonal variation
+
+See [ADR-003](./adr-003-anomaly-detection-first.md) for the full Phase 2 transition criteria.
+
+### SLA (Phase 2)
+
+| Guarantee | Target |
+|-----------|--------|
+| Freshness | Labels available in training pipeline within **24 hours** of creation |
+| Completeness | All `field_engineer` labels include `label_type` and `failure_mode` (when applicable) |
+| Join integrity | 100% of labels with non-null `alert_id` successfully join to `device_alerts` |
+
+---
 
 ## Cross-References
 

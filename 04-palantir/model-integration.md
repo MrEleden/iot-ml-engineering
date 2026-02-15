@@ -144,6 +144,21 @@ We train multiple unsupervised models for comparison:
 
 Each model gets its own Code Repository and model artifact. The scoring pipeline runs all models and writes results to the `AnomalyScore` object type (see [Ontology Design](./ontology-design.md)), allowing analysts to compare model outputs side by side.
 
+### Model Cards
+
+Each model variant should have a corresponding model card — a structured document stored alongside the model artifact in the Code Repository. The model card provides essential context for anyone reviewing, deploying, or auditing the model:
+
+| Field | Content |
+|---|---|
+| **Name / Version** | e.g., `isolation_forest_v3`, version `2026.02.01` |
+| **Intended Use** | Unsupervised anomaly detection on refrigeration device sensor data for predictive maintenance prioritization |
+| **Training Data** | Dataset path, transaction tag, date range, device count, schema version |
+| **Evaluation Metrics** | Score distribution stability (KL divergence < 0.05), contamination rate (4.8% ± 0.5%), precision-at-top-100 (72% on expert-labeled holdout) |
+| **Limitations** | Trained on temperate-climate fleet; performance on tropical-climate devices is unvalidated. Requires minimum 100 readings in the scoring window for reliable scores. |
+| **Ethical Considerations** | Scores may vary by equipment age; older devices naturally drift toward higher scores. Alerts should not be used as sole basis for equipment decommissioning decisions. |
+
+Update the model card on every model version publish. Store model cards as Markdown files in the Code Repository's `docs/` directory and link them from the model objective's description field in Foundry.
+
 ## Model Publishing and Versioning
 
 ### Publishing Flow
@@ -256,6 +271,69 @@ Create a model objective with custom metric definitions:
 
 If expert labels are insufficient (< 200 labeled examples), fall back to distribution-based metrics only and require manual approval for model promotion.
 
+## Shadow Deployment and Model Comparison
+
+Before promoting a new model version, run it alongside the production model to validate its behavior on live data. This section covers the shadow scoring pattern and progressive rollout strategy.
+
+### Shadow Scoring Pattern
+
+Deploy two models simultaneously:
+
+- **Champion**: the current production model. Its scores drive alerts, populate `Device.latest_anomaly_score`, and feed operational dashboards.
+- **Challenger**: the candidate model. Its scores are recorded for comparison but do not trigger alerts or update operational properties.
+
+Both models run in the same scoring Transform (or parallel Transforms on the same schedule), reading the same feature dataset. Results are written to the `AnomalyScore` backing dataset with distinct `model_id` and `deployment_role` values.
+
+**Comparison Transform**: a downstream Transform reads both champion and challenger scores and computes comparison metrics:
+
+```python
+@transform_df(
+    Output("/Company/pipelines/refrigeration/scores/model_comparison"),
+    champion=Input("/Company/pipelines/refrigeration/scores/isolation_forest_scores"),
+    challenger=Input("/Company/pipelines/refrigeration/scores/isolation_forest_v4_scores"),
+)
+def compare_models(champion, challenger):
+    joined = champion.join(challenger, on=["device_id", "scored_at_date"], how="inner")
+    return (
+        joined.select(
+            "device_id",
+            "scored_at_date",
+            F.col("champion.anomaly_score").alias("champion_score"),
+            F.col("challenger.anomaly_score").alias("challenger_score"),
+            F.abs(F.col("champion.anomaly_score") - F.col("challenger.anomaly_score")).alias("score_diff"),
+            (F.col("champion.anomaly_flag") & F.col("challenger.anomaly_flag")).alias("both_alert"),
+            (F.col("champion.anomaly_flag") & ~F.col("challenger.anomaly_flag")).alias("champion_only"),
+            (~F.col("champion.anomaly_flag") & F.col("challenger.anomaly_flag")).alias("challenger_only"),
+        )
+    )
+```
+
+Key metrics from the comparison:
+
+- **KL divergence** between champion and challenger score distributions: large divergence (>0.1) signals fundamentally different model behavior — investigate before promoting
+- **Alert overlap**: fraction of devices flagged by both models. Target > 80% overlap for a safe promotion.
+- **Disagreement analysis**: devices flagged only by the challenger are the most interesting — review them with domain experts to determine whether the challenger is finding real anomalies the champion misses
+
+**Promotion gate**: promote the challenger only after 7+ days of parallel scoring, documented expert review of disagreements, and no regressions on known false positive cases.
+
+### Progressive Rollout
+
+For large fleet changes or high-risk model updates, deploy progressively rather than fleet-wide:
+
+1. **Deploy by region**: update the model version for a single region (e.g., US-West) while other regions continue using the champion
+2. **Monitor for 48 hours**: track alert rate, false positive rate, and score distribution for the rollout region. Compare against the region's historical baseline.
+3. **Expand or roll back**: if metrics are stable, expand to the next region. If degradation is detected, roll back the region to the champion.
+
+Implement progressive rollout via a **configuration dataset** — a small Foundry dataset mapping `region` to `model_version`:
+
+| region | model_version | effective_date |
+|---|---|---|
+| US-West | isolation_forest_v4 | 2026-02-15 |
+| US-East | isolation_forest_v3 | 2026-01-01 |
+| EU-Central | isolation_forest_v3 | 2026-01-01 |
+
+The scoring Transform reads this configuration dataset and loads the appropriate model version per region. No code change is needed to roll out or roll back — only a data update to the configuration dataset.
+
 ## Limitations and Workarounds
 
 ### Limitation 1: No Native Unsupervised Evaluation
@@ -295,6 +373,48 @@ If memory becomes an issue, partition the scoring Transform by region — score 
 - **Autoencoder**: compute per-feature reconstruction error and rank by contribution to total error
 
 Write feature contributions to the `AnomalyScore.component_scores` property (see [Ontology Design](./ontology-design.md)) so operators can see *why* a device was flagged, not just the overall score.
+
+## Production Model Monitoring
+
+Deployed models degrade over time as fleet composition changes, sensor behavior drifts, and environmental conditions shift. Continuous monitoring detects degradation early and triggers corrective action before operational impact.
+
+### Continuous Performance Tracking
+
+A scheduled Transform (daily) computes production monitoring metrics and writes them to a `model_monitoring` dataset:
+
+| Metric | Computation | Threshold | Action |
+|---|---|---|---|
+| Score distribution mean | Mean anomaly score across all scored devices | Shift > 2σ from 30-day baseline | Investigate: model or data drift? |
+| Alert rate | Fraction of devices with `anomaly_flag = true` | > 10% or < 1% (vs expected ~5%) | Review threshold calibration |
+| False positive rate | Fraction of alerts marked `false_positive` in last 7 days | > 15% sustained for 7 days | Trigger retraining |
+| Feature drift (per-feature) | KL divergence of each input feature vs training distribution | > 0.1 for any feature | Investigate data pipeline or real change |
+| Prediction latency | Time from feature dataset update to scoring output commit | > 2x historical average | Investigate Transform performance |
+
+Each metric row includes `model_id`, `model_version`, `computed_at`, and the metric value. A Workshop dashboard visualizes these metrics as time series with threshold lines for quick triage.
+
+### Automated Retraining Triggers
+
+Three conditions trigger automated retraining:
+
+1. **Performance trigger**: false positive rate exceeds 15% for 7 consecutive days. The `model_monitoring` dataset tracks this via a rolling 7-day window. When the condition is met, a Foundry pipeline trigger initiates the training Transform with the latest feature data.
+
+2. **Data drift trigger**: KL divergence exceeds 0.1 for any input feature, sustained for 3 consecutive daily measurements. This indicates the input data distribution has shifted enough that the model's learned boundaries are no longer appropriate. The retraining pipeline re-fits the model on recent data (last 90 days) to capture the new distribution.
+
+3. **Fleet change trigger**: more than 5% of the fleet consists of new devices (installed within the last 30 days) that the current model has never seen during training. New device models or deployments in new climate zones can introduce sensor behavior patterns not represented in the training data. Detected by comparing the device registry's `install_date` distribution against the training data's device set.
+
+All retraining runs produce a challenger model, not an immediate replacement. The challenger must pass the shadow scoring and promotion gate process described above before becoming the new champion.
+
+### Rollback Procedure
+
+If a promoted model degrades in production:
+
+1. **Detection**: the monitoring Transform flags metric threshold breaches (e.g., alert rate spikes to 12%, false positive rate rises)
+2. **Rollback action**: update the model version in the configuration dataset (or the model reference in the scoring Transform) to the previous champion version
+3. **Effect**: the next scheduled scoring run uses the rolled-back model. No code change, no deployment, no Transform rebuild required.
+4. **Verification**: confirm that the rolled-back model's metrics return to baseline within 24 hours
+5. **Root cause**: investigate why the promoted model degraded — was it data drift, a training data issue, or a genuine distribution shift? Document findings in the model card.
+
+Keep the last 3 model versions in the model store at all times to ensure rollback targets are always available.
 
 ## Related Documents
 

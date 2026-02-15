@@ -64,9 +64,13 @@ Feature contributions are computed via permutation importance or mean decrease i
 - **Scikit-learn ships with Foundry's default Python environment.** No extra dependencies in `meta.yml` — reduces deployment friction (see [Model Integration](../04-palantir/model-integration.md)).
 - **Contamination parameter provides direct threshold control.** Setting `contamination=0.05` means roughly 5% of the fleet will be flagged. This is tunable without retraining.
 
+### Interpretability Enhancement: TreeSHAP
+
+Isolation Forest's default feature importance is global (which features matter across all predictions). For per-prediction explanations — especially critical for MEDIUM, HIGH, and CRITICAL alerts — use **TreeSHAP** (SHAP values for tree-based models). TreeSHAP computes each feature's contribution to a specific device's anomaly score, including direction (pushing the score higher or lower). Log SHAP values alongside `top_contributors` in Contract 5 output: store as `shap_values` (JSON-serialized dict of feature → SHAP value) for post-hoc analysis and expert review. TreeSHAP is computationally efficient for tree ensembles (polynomial in tree depth, not exponential) and is available via the `shap` library (add to `meta.yml`).
+
 ### Weaknesses
 
-- **Less interpretable than statistical methods.** Feature importance tells you which features mattered across the ensemble, but not the direction of the anomaly (is the value too high or too low?). Operators see "vibration_compressor_mean is a top contributor" but not "it's 3x higher than normal."
+- **Less interpretable than statistical methods.** Feature importance tells you which features mattered across the ensemble, but not the direction of the anomaly (is the value too high or too low?). Operators see "vibration_compressor_mean is a top contributor" but not "it's 3x higher than normal." TreeSHAP (see above) mitigates this by providing directional per-prediction explanations.
 - **Sensitive to contamination ratio.** If the true anomaly rate is 2% but `contamination=0.05`, the model flags 5% of devices — inflating false positives. If the true anomaly rate is 10% (during a fleet-wide issue), the model undercounts. The contamination parameter is a guess.
 - **No temporal modeling.** Each row (device × window) is scored independently. The model doesn't know that a device's anomaly score has been rising over the past 6 windows — it only sees the current window's features. Temporal trends must be captured in the feature engineering layer (e.g., `slope` features in [Time-Domain Features](../02-feature-engineering/time-domain.md)).
 - **Random subsampling introduces variance.** Different random seeds produce slightly different models. Use `random_state=42` and [experiment tracking](./experiment-tracking.md) to control this. Score determinism for Contract 5 requires fixed random seeds.
@@ -230,6 +234,7 @@ The same model type can be trained at three different granularity levels, each d
 - **Scale**: 100K devices × one model each = 100K model artifacts. Training, storing, versioning, and scoring becomes a major infrastructure challenge. Foundry's model framework is not designed for 100K model artifacts.
 - **Cold start**: new devices have no history. Per-device models can't score until ≥30 days of data accumulate. During this period, only fleet and cohort models cover the device.
 - **Overfitting**: with ~30 days of data from one device, the model may memorize rather than generalize. Seasonal patterns not in the 30-day window are flagged as anomalies when they first appear (e.g., summer temperature increase if trained on spring data).
+- **Model complexity vs. data size**: per-device training yields 3K–9K rows (30–90 days × 96 windows/day). This is sufficient for Isolation Forest (which subsamples to 256 rows per tree regardless) but marginal for a per-device Autoencoder. A dense AE with a 45→10 bottleneck has ~2K parameters — fitting 2K parameters on 3K rows risks overfitting, especially with contaminated data. For per-device AE, require ≥90 days of history (≥8.6K rows) and use aggressive regularization (dropout=0.2, weight decay=1e-4). Consider using the cohort AE as a pretrained backbone and fine-tuning only the final encoder/decoder layers on device-specific data (transfer learning) to reduce the effective parameter count.
 - **Operational overhead**: 100K model retraining jobs, 100K scoring jobs, 100K sets of metrics to monitor. Debugging a single device's model behavior requires finding and inspecting one of 100K artifacts.
 - **Stale models**: devices that change operating mode (moved to a different location, connected to different equipment) need model retraining. Detecting that a change is "new normal" vs. "anomaly" is the exact problem we're trying to solve.
 
@@ -294,6 +299,27 @@ For devices guarding critical inventory (>$10K loss on failure) or with known fa
 Accumulate confirmed/rejected anomaly alerts from field engineers. When sufficient labeled examples exist (target: ≥500 confirmed true positives, ≥500 confirmed false positives), train supervised failure prediction models. These models directly predict "failure within 12–24 hours" with calibrated probabilities.
 
 The unsupervised models continue running as complementary detectors for novel failure modes.
+
+### Phase 2: Handling Class Imbalance
+
+As pseudo-labels accumulate (confirmed anomalies from field feedback), class imbalance becomes a concrete problem. True failures are rare — expect a 20:1 to 50:1 ratio of normal-to-anomalous labeled examples. Imbalanced training data causes supervised models to optimize for the majority class (predicting "normal" for everything achieves 95%+ accuracy but is useless).
+
+**Mitigation strategies, in recommended order**:
+
+1. **Loss weighting (start here)**. Apply class weights inversely proportional to class frequency: `weight_anomalous = N_normal / N_anomalous`. For a 20:1 ratio, anomalous examples receive 20× the loss contribution. This is the simplest approach and requires no data manipulation — just a parameter change in the loss function. Supported natively in scikit-learn (`class_weight='balanced'`) and PyTorch (`CrossEntropyLoss(weight=...)`).
+
+2. **Undersampling the majority class**. Randomly sample the normal class down to a manageable ratio (e.g., 5:1 or 3:1). This reduces training set size and speeds up training. Risk: discarding normal examples may lose rare-but-legitimate normal operating modes (e.g., defrost cycles, high-load events). Mitigate by stratifying the undersample across operating modes.
+
+3. **SMOTE (use with caution for IoT data)**. Synthetic Minority Oversampling generates synthetic anomalous examples by interpolating between existing anomalous feature vectors. For tabular IoT features this can work, but be cautious: interpolating between two different failure modes (e.g., a compressor bearing failure and a refrigerant leak) creates synthetic examples that represent no real failure. Validate that SMOTE-generated examples are physically plausible by reviewing a sample with domain experts.
+
+4. **Data augmentation for time series**. For LSTM-AE or sequence-based supervised models, enrich the anomalous class through:
+   - **Jittering**: add small Gaussian noise (σ = 0.01–0.05 × feature std) to existing anomalous windows.
+   - **Scaling**: multiply feature values by a random factor in [0.9, 1.1] to simulate measurement variation.
+   - **Window slicing**: take sub-windows of anomalous sequences (if using sequence models) to create partially-overlapping augmented examples.
+   - **Magnitude warping**: apply smooth, random warping curves to the time axis of sensor readings.
+   These augmentations are more physically grounded than SMOTE because they simulate realistic sensor noise rather than interpolating between unrelated failures.
+
+5. **Evaluation on imbalanced test sets**. Regardless of training strategy, always evaluate on the natural class distribution (do not balance the test set). Use **Precision-Recall (PR) curves**, not ROC curves. ROC curves are misleadingly optimistic under heavy class imbalance because the false positive rate denominator (N_normal) is large, making even many false positives look like a low rate. PR curves expose the actual tradeoff between precision and recall at each threshold. Report **Average Precision (AP)** as the summary metric.
 
 ---
 

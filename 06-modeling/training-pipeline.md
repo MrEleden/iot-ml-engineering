@@ -43,6 +43,24 @@ We have no labeled anomalies, so training data is "normal" by assumption — spe
 - Cohort models: subset by cohort first, then apply the same volume limits per cohort.
 - Per-device models: all available data for that device (30–90 days × 96 windows/day ≈ 3K–9K rows per device).
 
+### Sampling Strategy and Stratification
+
+Subsampling 860M rows to 500K is a 1,700× reduction. Convenience sampling (e.g., taking the first 500K rows, or sampling only from devices that happen to report consistently) introduces systematic bias. The subsample must preserve the statistical properties of the full dataset.
+
+**Stratification criteria**:
+
+1. **By device model (proportional)**: if device model WC-200 represents 15% of the fleet, it should represent ~15% of the training subsample. This prevents the model from learning one device type's "normal" as the fleet's "normal."
+
+2. **By time period (uniform across training window)**: sample uniformly across calendar weeks within the training window. Without temporal uniformity, the subsample over-represents recent data (if the dataset is sorted by time) or a particular season. Each week in the 3-month window should contribute approximately equal rows.
+
+3. **By operating mode (defrost, high-load, idle)**: operating modes have different normal ranges. If defrost windows are only 5% of the data but are excluded from the subsample, the model flags all defrost behavior as anomalous. Stratify to ensure defrost windows, high door-open-fraction windows, and idle periods are represented at their natural frequencies.
+
+4. **Avoid convenience sampling**: do not sample only from devices with complete data or devices in a single geography. These subsets are not representative of the fleet.
+
+**Verification**: after subsampling, run a Kolmogorov-Smirnov (KS) test per feature between the subsample and the full dataset. The null hypothesis is that both come from the same distribution. If any feature rejects the null at p < 0.01 (with Bonferroni correction for ~45 features), the stratification is inadequate — adjust the sampling weights and re-sample.
+
+Log the KS test results in [experiment tracking](./experiment-tracking.md) under the `training_data_stats` field to provide an audit trail of subsample quality.
+
 ---
 
 ## Temporal Train/Validation Split
@@ -176,11 +194,56 @@ In addition to scheduled retraining, retrain immediately when:
 - **Anomaly rate deviates from expected**: if the model flags >2× or <0.5× the expected contamination rate, something shifted.
 - **Feature distribution shift**: if any input feature's mean or variance changes by >3σ from the training period's value, the model is scoring out-of-distribution.
 
+### Stateless vs. Stateful Retraining
+
+When retraining a model, there are two fundamentally different approaches:
+
+**Stateless retraining (train from scratch)**: discard the previous model entirely. Load the current rolling window of training data, apply all preprocessing and exclusion criteria, train a new model from random initialization, evaluate, and promote. The new model has no dependency on or memory of the previous model.
+
+**Stateful retraining (incremental / fine-tuning)**: start from the previous model's learned parameters and update them with new data. For neural networks, this means loading the previous model's weights and continuing gradient descent on the recent data (e.g., the most recent 1 month). For tree-based models, this is generally not supported — scikit-learn's Isolation Forest does not support incremental fitting.
+
+**Recommendations by model type**:
+
+| Model | Approach | Rationale |
+|-------|----------|----------|
+| Isolation Forest | Stateless | Training is fast (~seconds). Trees are not incrementally updatable. Full retrain on the 3-month rolling window is the only option and is cheap enough to do weekly. |
+| Statistical baseline | Stateless | Computing mean/std/covariance on the rolling window is trivial. No benefit from incremental updates. |
+| Dense Autoencoder | Evaluate stateful | Training is expensive (~12 minutes). Fine-tuning the existing model on the most recent 1 month of data (5–10 epochs, reduced learning rate = 1e-4) could save compute and preserve learned representations of stable patterns. Compare fine-tuned model quality against a full stateless retrain monthly — if fine-tuned model's validation reconstruction error diverges by >10% from the stateless version, the fine-tuning is accumulating drift. |
+| LSTM Autoencoder | Evaluate stateful | Same rationale as dense AE, but training is even more expensive (30+ minutes), making the compute savings from fine-tuning more significant. |
+
+**Risk of stateful retraining: contamination accumulation.** If the training data contains undetected anomalies, fine-tuning on contaminated data shifts the model's definition of "normal" incrementally toward the anomalous patterns. Over multiple fine-tuning cycles, this drift compounds. A model fine-tuned monthly for 6 months may have a substantially different "normal" than a model trained from scratch on the same 6-month window.
+
+**Mitigation: periodic full stateless reset.** Even if stateful retraining is used for monthly AE updates, perform a full stateless retrain quarterly (every 3 months). Compare the quarterly stateless model against the incrementally fine-tuned model. If they diverge significantly (rank correlation < 0.9 on device anomaly scores), the fine-tuning has accumulated contamination — promote the stateless model and restart the fine-tuning cycle from it.
+
 ### Training Window for Retraining
 
 Use a **rolling window**, not an expanding window. Train on the most recent N months, not all historical data. This prevents ancient data (which may reflect decommissioned device types or outdated operating conditions) from diluting current patterns.
 
 Recommended: 3-month rolling window for Isolation Forest, 6-month for Autoencoder (needs more data and seasonal coverage).
+
+### Rolling Window "Forgetting" Risk
+
+A rolling window discards data older than N months. This is intentional — ancient data reflects decommissioned devices and outdated conditions. But it also means **patterns that occurred only outside the current window are lost**. A rare failure mode that appeared 8 months ago and hasn't recurred is no longer in the training data. If it recurs, the model may not recognize it because the failure exemplars were rolled out of the window.
+
+**Mitigation: maintain a curated "failure exemplar set."** When a confirmed anomaly or failure is identified (via expert review, maintenance correlation, or field feedback), archive the device's feature windows from 48 hours before through the failure event in a dedicated `failure_exemplars` dataset. This dataset is append-only and never subject to the rolling window. During training, concatenate the rolling window data with the failure exemplar set. For unsupervised models, the exemplar set serves as a contamination-aware reference — these known anomalies can be used for validation ("does the new model still flag these known failures?"). For future supervised models, the exemplar set provides the positive class training examples.
+
+Review the failure exemplar set quarterly. Remove exemplars from decommissioned device types or obsolete failure modes. Add exemplars from new confirmed failures.
+
+### Data Augmentation for Time Series
+
+Per-device models and small cohorts may have limited training data (3K–9K rows per device, or fewer than 1K rows for a small cohort). Data augmentation enriches the "normal" distribution without collecting more real data, helping the model learn a more robust boundary around normality.
+
+**Recommended augmentation techniques for tabular IoT features**:
+
+1. **Jittering**: add small Gaussian noise to each feature value. Use σ = 0.01–0.03 × the feature's standard deviation from the training set. This simulates sensor measurement noise without changing the underlying signal.
+
+2. **Scaling**: multiply each feature vector by a random scalar drawn from Uniform(0.95, 1.05). This simulates minor calibration differences across sensor units.
+
+3. **Magnitude warping**: apply a smooth random warping curve (e.g., cubic spline with 3–4 knots, knot magnitudes drawn from Normal(1.0, 0.1)) to each feature independently. This creates realistic non-uniform distortions.
+
+4. **Window cropping**: for sequence-based models (LSTM-AE), randomly crop sub-sequences from longer normal sequences to create partially-overlapping augmented training examples.
+
+**Guidelines**: augment only the training set, never the validation set. Augmented rows should be tagged (`is_augmented = true`) so they can be filtered for analysis. Limit augmented rows to ≤2× the original training set size — excessive augmentation causes the model to learn the augmentation distribution rather than the true data distribution. Validate that augmentation improves (or at least does not degrade) validation reconstruction error or anomaly score separation.
 
 ---
 

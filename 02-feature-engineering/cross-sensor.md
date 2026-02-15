@@ -200,6 +200,24 @@ model_input = (
 )
 ```
 
+> **Data Leakage Warning for Fleet Z-Scores**: cohort statistics (mean and std used for z-score computation) must be computed exclusively from training-partition data where `window_end <= T` (the training cutoff). If fleet statistics include data from the validation or test period, every device's z-score leaks information about future fleet behavior into the training set. In practice, the `fleet_stats` computation should accept a `training_cutoff_timestamp` parameter and filter `device_features` to `window_end <= training_cutoff_timestamp` before computing cohort aggregates. At fleet scale (100K devices), ideally the target device should be excluded from its own cohort statistics (leave-one-out) to avoid self-influence, though the effect is negligible at 100K and can be skipped for computational simplicity.
+
+### Feature Generalization Across Equipment Models
+
+Different equipment models have fundamentally different baseline operating ranges. A walk-in freezer operates at -20°C evaporator temperature while a display case runs at -5°C. A 5 HP compressor draws 15 A while a 2 HP unit draws 6 A. Features like `pressure_ratio`, `temp_spread_evap_cond`, and `current_per_temp_spread` have different normal ranges across equipment models.
+
+Two approaches handle this:
+
+**Approach 1: Per-model models** — train separate anomaly detection models for each equipment model (or model family). Each model learns the baseline for its equipment type. This avoids the need for cross-model normalization but requires sufficient training data per equipment model. Equipment models with fewer than 500 devices in the fleet may produce unreliable models.
+
+**Approach 2: Model-aware normalization via cohort z-scores** — normalize each device's features against its equipment-model cohort using z-scores (described above). A single anomaly detection model then operates on z-scored features, where a z-score of 0 means "normal for this equipment type" regardless of the absolute value. This pools training data across equipment models and produces a single model, but assumes that anomaly patterns are similar across equipment types after normalization.
+
+The choice between these approaches is an ML Scientist decision based on fleet composition and available training data. The Feature Engineer's responsibility is to ensure that:
+
+1. Equipment model metadata is available and joinable (via `device_id` → device registry → `model` field in the [Ontology](../04-palantir/ontology-design.md))
+2. Cohort z-score computation is implemented and tested (see fleet z-scores above)
+3. Both raw and z-scored features can be produced at model-input time without modifying the feature store schema
+
 ## Computation Order and Dependencies
 
 Cross-sensor features depend on time-domain aggregations. The computation order within a window:
@@ -269,6 +287,18 @@ A `pressure_ratio` below 1.0 means low-side pressure exceeds high-side pressure 
 ### Ambient Temperature Confounding
 
 `temp_spread_evap_cond` varies with ambient temperature — a 35°C day naturally produces a wider spread than a 15°C day. This is not a flaw; it's expected physics. The anomaly model should capture regional and seasonal norms. Fleet-relative z-scores (comparing a device against its cohort in the same region) further normalize for ambient conditions.
+
+### Covariate Shift Monitoring
+
+Several external factors cause systematic shifts in cross-sensor feature distributions that are not equipment faults but still affect model performance:
+
+**Seasonal ambient temperature shifts**: ambient temperature directly influences `temp_spread_evap_cond`, `pressure_ratio`, and `current_per_temp_spread`. A fleet-wide shift in these features during seasonal transitions is expected. Models trained on summer data may produce elevated anomaly scores in winter (or vice versa) if seasonal variation was not represented in the training set. Monitor per-feature PSI (Population Stability Index) monthly against the training reference distribution, segmented by climate region.
+
+**Fleet composition changes**: adding a batch of new equipment models to the fleet changes the overall feature distribution. If the new model has different baseline operating characteristics, fleet-level z-scores shift for all devices. Track fleet composition (count per equipment model per month) and flag when the composition diverges significantly from the training-set composition.
+
+**Regulatory refrigerant changes**: transitions between refrigerant types (e.g., R-404A to R-448A for environmental compliance) change the thermodynamic properties of the system. Pressure ratios, superheat values, and subcooling values shift to new baselines. These transitions are announced well in advance — coordinate with the ML Scientist to plan model retraining before the transition reaches a significant fraction of the fleet.
+
+**Monitoring implementation**: compute PSI per cross-sensor feature per month. Compare against the reference distribution snapshot stored with the model artifact (see [Feature Store — Feature Statistics as Model Artifact](./feature-store.md)). Flag features with PSI > 0.1 for review and PSI > 0.25 for urgent retraining evaluation.
 
 ## Related Documents
 

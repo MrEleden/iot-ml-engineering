@@ -154,3 +154,43 @@ Once sensor readings land in the batch view of the streaming dataset, they flow 
 - **[Transform Patterns](./transform-patterns.md)** — incremental Transforms pick up each new materialization transaction and compute features
 - **[Ontology Design](./ontology-design.md)** — the `SensorReading` object type is backed by the materialized dataset
 - **[Model Integration](./model-integration.md)** — batch scoring Transforms consume feature datasets derived from this ingestion pipeline
+
+## ML Pipeline Considerations
+
+Streaming datasets introduce specific challenges for ML workflows. The following subsections address how to handle training data versioning, temporal correctness, and schema evolution when building ML pipelines on top of streaming ingestion.
+
+### Training Data Versioning
+
+Never train a model directly on a live streaming dataset. The streaming dataset is continuously appending new transactions, so two training runs at different times would see different data — making reproducibility impossible.
+
+Instead, define training sets by **transaction range**:
+
+1. **Snapshot the batch view**: identify the start and end transaction IDs that correspond to the desired training window (e.g., 2026-01-01 to 2026-01-31)
+2. **Tag the snapshot**: use Foundry dataset tagging to label the pair of transactions as `training_set_v3_jan2026` — this creates a human-readable, immutable reference
+3. **Reference the tag in training code**: the training Transform reads from the tagged transaction range, not from "latest" — guaranteeing that re-running the Transform produces identical training data
+4. **Store the tag in model metadata**: when the trained model is published, record the training data tag alongside the model version for full provenance
+
+This approach ensures every model version can answer the question: "exactly which data was this model trained on?"
+
+### Point-in-Time Correctness
+
+The materialized batch view orders data by **transaction** (the order in which 5-minute batches were committed to Foundry), not by **device timestamp** (the time the sensor reading was actually recorded). These can differ significantly:
+
+- A device that was offline for 2 hours sends buffered readings when it reconnects — the transaction timestamp is "now" but the device timestamps span the past 2 hours
+- Network latency and Event Hubs partition rebalancing introduce variable delays between device timestamp and Foundry transaction timestamp
+
+For ML pipelines, always use the **device timestamp** (`timestamp` field) as the temporal key for label joins and feature computation — never `_foundry_ingest_timestamp`. Specifically:
+
+- When joining labels (e.g., maintenance events) to feature windows, ensure the feature window's time boundary is defined by device timestamp
+- When computing time-windowed aggregations for training features, order by device timestamp to avoid data leakage from future readings that arrived in the same transaction
+- When splitting data into train/validation/test sets, split by device timestamp ranges, not by transaction boundaries
+
+### Schema Evolution for ML Pipelines
+
+The streaming dataset's schema evolves as new firmware versions add sensor fields or change payload formats. This has direct consequences for ML pipelines:
+
+- **New sensor fields produce null for old messages**: when a new sensor (e.g., `oil_pressure`) is added to the schema, historical messages lack this field. The streaming dataset backfills these as null columns. Training pipelines must handle these nulls explicitly — either drop the column for models trained on historical data, or impute with a documented default.
+- **Training pipelines must handle schema transitions**: a model trained on data from January (10 sensor fields) cannot score February data (12 sensor fields) without adapter changes. Pin the feature column list in the model adapter and validate that all expected columns are present at scoring time.
+- **Consider a `schema_version` column**: add a `schema_version` field to the streaming dataset schema, populated by the device firmware version or a mapping table. This allows training pipelines to filter training data to a consistent schema version, and allows scoring pipelines to apply version-specific preprocessing.
+
+Document each schema change with the date it took effect and which devices are affected. A schema changelog dataset (mapping `schema_version` → column list → effective date) is invaluable for debugging feature drift caused by schema evolution rather than genuine behavioral change.

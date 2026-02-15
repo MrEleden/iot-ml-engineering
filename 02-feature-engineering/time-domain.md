@@ -38,6 +38,18 @@ Not every sensor needs every aggregation. The map below shows which aggregations
 
 Sensors like `door_open_close` and `defrost_cycle` are boolean and get fraction-based aggregations instead (`door_open_fraction`, `defrost_active_fraction`). These are covered in the output schema but don't use the statistical aggregations above.
 
+### Feature Importance Validation
+
+With 50+ feature columns spanning 12 sensors × multiple aggregations, not all features contribute equally to anomaly detection. Feature importance must be validated before expanding the feature set, and periodically re-validated as the fleet evolves.
+
+**For Isolation Forest**: use permutation importance — randomly shuffle each feature column in the validation set and measure the change in anomaly score distribution. Features whose shuffling does not change the anomaly ranking are candidates for removal. Permutation importance is model-agnostic and avoids the bias of tree-based feature importance metrics.
+
+**For Autoencoders**: measure per-feature reconstruction error contribution. Features with consistently low reconstruction error relative to their variance are not being used by the model and may add noise. Decompose the total reconstruction loss into per-feature components and rank by contribution.
+
+**Dimensionality concern**: the current feature set produces approximately 50 columns. For Isolation Forest, performance degrades as dimensionality grows because random splits become less effective. If feature count exceeds 50, evaluate whether marginal features improve detection or merely add noise. Consider PCA as a dimensionality reduction step, though this trades interpretability for compactness.
+
+Feature importance validation is a joint responsibility between the Feature Engineer and the ML Scientist. The Feature Engineer proposes features based on domain knowledge (this document); the ML Scientist validates them empirically using the [evaluation framework](../06-modeling/evaluation-framework.md). Features that fail importance validation should be excluded from [Contract 4](../05-architecture/data-contracts.md) model input, not removed from [Contract 3](../05-architecture/data-contracts.md) storage — they may prove useful for future model architectures.
+
 ## Rolling Statistics
 
 ### Mean and Standard Deviation
@@ -214,6 +226,8 @@ A lag feature compares the current window's value to the same feature N windows 
 
 **Trade-off**: computing lags at model-input time introduces a self-join on `device_features`. For 100K devices × 3 window sizes, this is feasible but should use partition pruning on `window_start`.
 
+> **Data Leakage Warning**: lag joins must respect temporal train/test splits. When constructing training examples for a model with training cutoff at time T, lag features for windows near the cutoff must not reference any window with `window_end > T`. In practice, this means the lag join condition should include `lagged.window_end <= :training_cutoff` in addition to the time-offset condition. Failing to enforce this allows the model to learn from future data during training — features that will not be available at inference time. See [Feature Store — Point-in-Time Correctness](./feature-store.md) for the broader leakage prevention framework.
+
 ## Implementation Notes
 
 ### Transform Structure
@@ -229,6 +243,69 @@ Following the [pre-aggregate then merge pattern](../04-palantir/transform-patter
 - For slope computation, the manual sum-of-products approach avoids UDF overhead and stays within Spark's native execution engine. Pandas UDFs would work but add serialization cost at 100K-device scale.
 - `percentile_approx` is preferred over exact percentile for p95 — the approximation error is negligible for anomaly detection, and performance is significantly better.
 - All window aggregations should be computed in a single `groupBy` pass per window size, not separate passes per feature. This avoids redundant shuffles.
+
+## Feature Scaling Considerations
+
+Sensor readings span vastly different physical scales: evaporator temperature operates around -25°C to 0°C, high-side pressure around 500–2500 kPa, compressor current around 5–30 A, and vibration in arbitrary acceleration units. When these raw-scale features enter a distance-based or reconstruction-based model, the features with the largest numeric range dominate.
+
+### Standardization for Anomaly Detection
+
+For Isolation Forest, standardization (z-score normalization) is not strictly required because the algorithm splits on individual features. However, when features vary by orders of magnitude, the random split thresholds become unevenly distributed across features, subtly biasing the model. For Autoencoders, standardization is critical — reconstruction error is computed across all features, and unscaled features cause the model to focus on minimizing error for high-magnitude features while ignoring low-magnitude ones.
+
+Recommendation: apply z-score standardization (subtract mean, divide by std) to all numeric features before model input.
+
+### Critical Rule: Scale After Temporal Split
+
+Scaling parameters (mean and std per feature) must be computed exclusively from the training partition. The procedure:
+
+1. Split `device_features` temporally (train on `window_end ≤ T`, validate/test on `window_end > T`)
+2. Compute per-feature mean and std from the training partition only
+3. Apply those same parameters to the validation and test partitions
+
+Fitting the scaler on the full dataset (including validation/test) leaks distributional information from the future into the training process. This is a common source of overly optimistic evaluation metrics that do not hold in production.
+
+### Scaling Is Not a Feature Store Concern
+
+Features in `device_features` are stored unscaled, in their original physical units. Scaling is applied at model-input transform time ([Contract 4](../05-architecture/data-contracts.md)), not during feature computation. This ensures that:
+
+- The feature store remains model-agnostic (different models may use different scaling strategies)
+- Stored values are interpretable by humans and dashboards without inverse-transforming
+- Scaling parameters are versioned with the model artifact, not with the feature pipeline
+
+## Feature Distribution Monitoring
+
+Feature distributions shift over time due to seasonal effects, fleet composition changes, firmware updates, and equipment aging. Monitoring these shifts is essential for knowing when models need retraining.
+
+### Per-Feature Fleet-Wide Tracking
+
+For each numeric feature column in `device_features`, track the following statistics per day across the entire fleet:
+
+| Statistic | Purpose |
+|-----------|---------|
+| Mean | Detect fleet-wide baseline shift |
+| Std | Detect variance changes (fleet homogeneity) |
+| p5 / p50 / p95 | Detect distributional shape changes beyond mean and std |
+| Null fraction | Detect upstream data quality degradation |
+
+Compute these as a daily monitoring transform that reads the 1-day window partition and outputs one summary row per feature per day.
+
+### Seasonal Baselines
+
+Temperature-dependent features (`temp_evaporator_mean`, `temp_condenser_mean`, `temp_spread_evap_cond`, `current_per_temp_spread`) exhibit strong seasonal patterns. A rising `temp_condenser_mean` fleet-wide in summer is expected, not drift. Monitoring must compare against the same calendar period from the prior year, not just the prior week. Build seasonal baseline profiles from the first full year of data and update annually.
+
+### Feature-Level Drift as Retraining Trigger
+
+Drift detection compares the current feature distribution against the reference distribution from the model's training set. Three complementary metrics:
+
+| Metric | Strengths | Threshold |
+|--------|-----------|----------|
+| KL Divergence | Sensitive to tail changes | > 0.1 nats moderate, > 0.5 nats significant |
+| PSI (Population Stability Index) | Industry-standard, interpretable bins | > 0.1 moderate, > 0.25 significant |
+| Wasserstein Distance | Metric-aware (respects value magnitude), no binning required | Feature-specific, calibrate empirically |
+
+When multiple features cross the moderate threshold simultaneously, or any single feature crosses the significant threshold, this should trigger a retraining evaluation. Drift detection does not automatically retrain — it creates a ticket for the ML Scientist to investigate whether the drift is benign (seasonal) or degrading model performance.
+
+See [Monitoring](../03-production/monitoring.md) for the operational monitoring framework that consumes these drift signals.
 
 ## Related Documents
 

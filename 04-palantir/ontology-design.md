@@ -190,6 +190,33 @@ Flow:
 
 Features are at most 1 hour stale (bounded by the pre-hydration Transform schedule). For the refrigeration use case, this is acceptable — maintenance decisions don't need sub-minute feature freshness. If sub-minute freshness is ever needed for specific properties, consider Foundry's streaming Ontology sync (available for object types backed by streaming datasets).
 
+### Online-Offline Consistency Validation
+
+Pre-hydrated properties (online) and the backing feature datasets (offline) can diverge due to Transform failures, scheduling delays, or partial updates. Left unchecked, this divergence means the model scores displayed in Workshop dashboards differ from those computed by the batch scoring pipeline — eroding operator trust.
+
+Validate consistency with a daily reconciliation Transform:
+
+1. **Read the Device backing dataset** (online values): extract `device_id`, `latest_anomaly_score`, `avg_temperature_evaporator_24h`, and `reading_count_24h`
+2. **Read the offline feature dataset**: extract the same metrics for the same devices and the same time window
+3. **Compare**: compute the absolute and relative difference per device per metric
+4. **Flag mismatches**: a mismatch rate metric tracks the fraction of devices where the relative difference exceeds 5%. Write this metric to a monitoring dataset.
+
+Acceptable tolerance: pre-hydrated values may lag the offline feature dataset by up to one Transform cycle (1 hour). Differences within this timing delta are expected. Differences beyond the timing delta indicate a failed or stuck pre-hydration Transform — trigger an alert.
+
+Target: mismatch rate < 5% relative for all pre-hydrated feature properties.
+
+### Feature Versioning
+
+When a pre-hydrated property's computation logic changes (e.g., `avg_temperature_evaporator_24h` switches from simple mean to trimmed mean), both the online and offline feature values change simultaneously — but downstream consumers (Workshop dashboards, scoring Transforms) may depend on the previous semantics.
+
+Manage feature versioning transitions:
+
+1. **Version suffix during transition**: add the new property with a version suffix (e.g., `avg_temperature_evaporator_24h_v2`) alongside the original. Both properties are pre-hydrated during the transition period.
+2. **Feature changelog dataset**: maintain a dataset recording each feature change — property name, version, change description, effective date, and the Code Repository commit that introduced the change. This dataset is the authoritative reference for "what does this property mean as of date X?"
+3. **Deprecation after migration**: once all downstream consumers (dashboards, scoring Transforms, OSDK apps) have migrated to the new version, remove the old property from the backing dataset and the Ontology schema. Document the deprecation date in the feature changelog.
+
+Transition period: minimum 2 weeks. This gives dashboard owners and model maintainers time to validate the new property and update references.
+
 ### What to Pre-Hydrate
 
 Only properties that are frequently queried by apps and dashboards. Do not pre-hydrate the full feature vector (50+ features) — that bloats the `Device` object and increases Ontology sync time. Pre-hydrate:
@@ -367,6 +394,57 @@ For the current architecture, sensor time series are batch-backed (hourly refres
 **Effect**: Updates `Alert.escalation_level` to `target_level`, sets `Alert.escalated_at` to current timestamp, and writes `Alert.escalated_to`. If escalating to `L3`, triggers an automatic notification to the vendor/specialist team via OSDK webhook. The escalation is logged in the audit trail for SLA compliance reporting.
 
 **Automation**: an AIP Logic function can auto-escalate alerts where `sla_breached` is `true` and `escalation_level` is still `L1` — this ensures no alert silently breaches SLA without visibility.
+
+## Monitoring and Drift Detection
+
+Pre-hydrated properties and anomaly scores are live operational signals. Monitoring their statistical behavior over time detects feature drift and model degradation before they manifest as missed anomalies or false alert storms.
+
+### Feature Drift on Pre-Hydrated Properties
+
+A daily scheduled Transform computes distribution statistics for each pre-hydrated feature property on the Device object type:
+
+| Metric | Computation | Purpose |
+|---|---|---|
+| Mean | Average of property value across all devices | Detect population-level shifts |
+| Standard deviation | Stddev across all devices | Detect changes in spread |
+| P5, P50, P95 | Percentile values | Detect distribution shape changes |
+| Null rate | Fraction of devices with null property value | Detect connectivity or pipeline issues |
+| Distinct count | Number of unique values (for categorical properties like `health_status`) | Detect new categories or missing categories |
+
+These statistics are written to a `feature_drift_stats` dataset, partitioned by date. A dataset expectation compares each day's statistics against a 30-day rolling baseline:
+
+- **Flag >2σ shifts**: if today's mean deviates from the 30-day mean by more than 2 standard deviations, flag the property. This catches gradual drift (seasonal temperature changes affecting `avg_temperature_evaporator_24h`) and sudden shifts (a firmware update changing sensor calibration).
+- **Flag null rate spikes**: if the null rate for any property exceeds the 30-day average null rate by more than 5 percentage points, flag it — this often indicates a pipeline failure upstream rather than genuine data change.
+
+Review flagged properties weekly. Not all drift is problematic — seasonal variation is expected. But drift that correlates with model performance degradation (rising false positive rate) requires investigation and potential model retraining.
+
+### Model Version Comparison via AnomalyScore
+
+When evaluating a new model version, run both the current (champion) and candidate (challenger) models in parallel and compare their scoring behavior through the Ontology.
+
+**Deployment role property**: add a `deployment_role` property to the `AnomalyScore` object type:
+
+| Value | Meaning |
+|---|---|
+| `champion` | The production model whose scores drive alerts and dashboards |
+| `challenger` | A candidate model being evaluated — scores are recorded but do not trigger alerts |
+| `shadow` | A model running in shadow mode for long-term comparison — no operational impact |
+
+Both champion and challenger scores are written to the `AnomalyScore` backing dataset with their respective `deployment_role` values. The `Device.latest_anomaly_score` pre-hydrated property always reflects the champion model.
+
+**Workshop dashboard for side-by-side comparison**: build a Workshop dashboard that filters `AnomalyScore` by `deployment_role` and displays:
+
+- Score distribution comparison (histogram overlay: champion vs challenger)
+- Alert overlap analysis (how many devices are flagged by both, only champion, only challenger)
+- Top disagreements (devices with the largest score difference between models)
+- Score correlation scatter plot (champion score on x-axis, challenger on y-axis)
+
+**Promotion decision criteria**: promote the challenger to champion when:
+
+1. Score distribution is stable over at least 7 days of parallel scoring
+2. Alert overlap with the champion is > 80% (the challenger catches most of the same anomalies)
+3. Disagreements are reviewed by domain experts and the challenger's unique detections are judged as genuine improvements
+4. No regression on known false positive cases (devices previously marked as false positives by operators should not be re-flagged)
 
 ## Related Documents
 

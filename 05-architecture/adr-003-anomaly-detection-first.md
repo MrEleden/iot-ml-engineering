@@ -98,6 +98,66 @@ Mitigation: cohort models provide reasonable anomaly detection for new devices i
 
 Mitigation: periodic retraining (monthly for statistical/tree-based, quarterly for autoencoders). Seasonal features (day of year, ambient temperature baseline) included in the feature set to make models season-aware. See [Data Quality & Monitoring](../03-production/data-quality.md) for drift detection.
 
+### Drift Detection & Retraining Triggers
+
+Between scheduled retraining cycles, automated drift monitoring runs after every batch scoring job. The following statistics are tracked:
+
+**Feature-level drift:**
+- **Population Stability Index (PSI)** is computed per feature group (temperature, pressure, compressor, environment, thermodynamic) by comparing the current scoring window's feature distribution against the training baseline stored in `feature_baselines`. A PSI > 0.2 for any feature group indicates meaningful distribution shift and triggers a retraining alert.
+- **Kolmogorov-Smirnov test** per individual feature — a K-S statistic > 0.1 sustained for 3+ consecutive scoring runs generates a warning-level drift notification.
+
+**Score-level drift:**
+- **Anomaly score distribution divergence** is measured using KL-divergence between the current run's score distribution and the trailing 30-day score distribution. KL-divergence > 0.15 triggers a retraining recommendation.
+- **Anomaly rate trend** — the percentage of devices flagged as anomalous per run is tracked. A sustained increase of > 15% above the 30-day moving average for 3+ consecutive runs triggers investigation.
+
+**Operational signals:**
+- **Alert volume trends** — weekly alert counts per severity level are tracked. A 2× increase in HIGH/CRITICAL alerts within a 2-week window triggers urgent model review.
+- **False positive feedback rate** — if field engineers mark > 30% of reviewed alerts as `FALSE_POSITIVE` within a rolling 30-day window, retraining is triggered.
+
+When drift thresholds are exceeded, the monitoring transform writes a trigger record to the `retraining_triggers` dataset. The training pipeline consumes these triggers and initiates an on-demand retraining cycle. See [System Overview](./system-overview.md) for the feedback loop diagram and [Training Pipeline](../06-modeling/training-pipeline.md) for implementation details.
+
+### Evaluation Without Labels
+
+In Phase 1, we lack ground-truth failure labels, so model quality is assessed using proxy metrics that do not require labeled outcome data:
+
+- **Score distribution stability.** A well-behaved model produces a consistent anomaly score distribution over time (absent genuine fleet changes). Large shifts in score mean, variance, or tail percentiles without a known operational cause indicate model degradation.
+- **Agreement rate between model families.** When statistical, Isolation Forest, and Autoencoder models all flag the same device in the same window, confidence is high. The inter-model agreement rate (fraction of flagged windows where ≥ 2 model families agree) is tracked over time. A declining agreement rate suggests that one or more models are drifting.
+- **Correlation with maintenance events.** Even without formal labels, maintenance records (work orders, site visits) can be loosely joined to anomaly detections by device and time window. A positive correlation between anomaly detections and subsequent maintenance events (within 7 days) is a weak but useful proxy for model utility. This correlation coefficient is tracked monthly.
+- **Alert actionability rate.** The fraction of non-suppressed alerts that are acknowledged (status changes from `OPEN` to `ACKNOWLEDGED` or `IN_PROGRESS`) within the SLA window serves as a proxy for alert relevance. An actionability rate below 50% for `HIGH` severity alerts suggests excessive false positives.
+
+These proxy metrics are not substitutes for labeled evaluation but provide directional signal on model health during the unsupervised phase.
+
+### Feedback Loop Latency
+
+The time from anomaly alert to confirmed label determines how quickly the system can incorporate feedback into training data:
+
+- **Alert to field visit**: typically 2–48 hours depending on severity and site staffing. CRITICAL alerts target < 4 hours; MEDIUM alerts may wait 24–48 hours.
+- **Field visit to label entry**: 0–72 hours. Field engineers record outcomes via mobile interface or maintenance system. Some sites have same-day recording; others batch updates weekly.
+- **Expected label delay**: on average, 3–5 days from anomaly detection to label availability. For planning purposes, training data assembly uses a configurable `label_delay_buffer` (default 24 hours) that represents the minimum time between feature window end and label event, but the actual end-to-end feedback loop is much longer.
+
+This latency means that rapid model adaptation based on individual feedback events is impractical. Instead, feedback accumulates over weeks and is incorporated during scheduled or drift-triggered retraining cycles. The system is designed for batch feedback integration rather than online learning.
+
+### Phase 2 Transition Criteria
+
+The system transitions from unsupervised anomaly detection (Phase 1) to supervised failure prediction (Phase 2) when the following criteria are met:
+
+**Minimum labeled examples:**
+- At least 1,000 labeled events across ≥ 500 distinct devices
+- At least 100 confirmed failure events (`label_type = failure_confirmed`) representing ≥ 3 distinct failure modes
+- Negative examples (normal operation confirmed) outnumber positive examples by no more than 50:1 to ensure the imbalance is manageable with standard techniques (SMOTE, class weighting)
+
+**Label quality requirements:**
+- ≥ 80% of labels have `label_confidence` ≥ 0.7 (i.e., primarily field-engineer-sourced, not heuristic)
+- Label consistency: for devices with multiple labels, inter-labeler agreement ≥ 70% (measured on a subset with duplicate labeling)
+- Temporal coverage: labels span at least 3 months to capture seasonal variation
+
+**Hold-out evaluation protocol:**
+- Supervised candidate models are evaluated on a time-based hold-out set (most recent 20% of labeled data by timestamp, not random split)
+- Candidate models must exceed the unsupervised baseline on precision@k (k = number of devices maintainable per day) and demonstrate higher AUROC on the hold-out set
+- A/B comparison: the supervised model runs in shadow mode alongside the unsupervised production models for 14 days before promotion. See [ADR-002](./adr-002-batch-plus-streaming.md) for shadow scoring design.
+
+Phase 2 activation is a manual decision by the ML team after reviewing these criteria. Unsupervised models continue running in parallel even after Phase 2 activation to catch novel failure modes not represented in the labeled dataset.
+
 ## Alternatives Considered
 
 ### Start with Supervised Failure Prediction
