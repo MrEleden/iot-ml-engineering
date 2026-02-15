@@ -1,75 +1,120 @@
-# Streaming vs Batch Tradeoffs
+# Streaming vs Batch in the Ingestion Pipeline
 
-## When to Use Each
+## Why This Decision Matters
 
-| | Streaming | Batch |
-|---|---|---|
-| **Latency** | Seconds to minutes | Minutes to hours |
-| **Use case** | Real-time alerts, live dashboards | Feature engineering, model training, reporting |
-| **Complexity** | Higher (state management, exactly-once) | Lower (idempotent rewrites) |
-| **Cost** | Always-on compute | Scheduled, scales to zero |
-| **Debugging** | Harder (stateful, time-dependent) | Easier (reproducible, replayable) |
+The ingestion layer has two distinct jobs: get data into Foundry (ingestion) and clean it for downstream use (processing). Streaming and batch are both available in Foundry, and they have fundamentally different cost, complexity, and latency profiles. Choosing wrong means either paying for real-time infrastructure you don't need, or missing acute failures that develop in minutes.
 
-## The Hybrid Pattern (Lambda-ish)
+This document explains the choices _within_ the ingestion layer. For the broader scoring architecture (batch scoring + streaming scoring), see [ADR-002: Hybrid Batch + Streaming](../05-architecture/adr-002-batch-plus-streaming.md).
 
-In practice, most IoT ML systems need both. The pattern:
+## The Hybrid Pattern
+
+The ingestion pipeline uses streaming for getting data in and batch for processing it:
 
 ```
-Kafka ──┬──▶ Stream Processor ──▶ Real-time alerts (seconds)
-        │
-        └──▶ Landing Zone (Parquet) ──▶ Batch PySpark ──▶ Feature Store ──▶ Model Training
+Streaming ingestion → Batch cleansing → Batch feature engineering → Batch scoring
+                  ↘ Streaming scoring (acute anomalies only)
 ```
 
-**Stream path**: lightweight rules — threshold alerts ("temperature > -10°C for fridge"), device health monitoring, live dashboards. Minimal state, minimal feature computation.
+Each arrow represents a deliberate choice. Here's why.
 
-**Batch path**: heavy feature engineering — rolling windows, cross-sensor correlations, frequency-domain features. Runs on schedule (hourly or daily), reads from the landing zone.
+### Streaming for Ingestion
 
-## Why Not Pure Streaming?
+IoT devices send data continuously. Polling 100K devices on a schedule would require a custom orchestrator, introduce latency proportional to the polling interval, and create thundering-herd load patterns. Streaming ingestion — via the Foundry streaming dataset connected to Event Hubs — avoids all of this:
 
-It's tempting to do everything in streaming (Spark Structured Streaming, Flink, etc.), but for ML feature engineering:
+- **Continuous delivery**: data arrives as devices send it, no polling delay.
+- **Managed infrastructure**: Foundry handles consumer offsets, deserialization, and dead-letter routing. No custom consumers to operate.
+- **Dual view**: the streaming dataset provides both a real-time streaming view (for acute anomaly detection) and a batch view via 5-minute materialization (for everything else).
 
-1. **Feature computation is expensive** — computing a 7-day rolling standard deviation across 10,000 devices in a stream requires maintaining large state. In batch, it's a simple window function over Parquet files.
+Streaming ingestion is not a choice — it's the only viable approach at 14M readings/min from devices that push data asynchronously.
 
-2. **Backfill is painful** — when you add a new feature or fix a bug, you need to recompute history. Streaming has no concept of "reprocess last 6 months." Batch does this natively.
+### Batch for Cleansing (Contract 2)
 
-3. **Point-in-time correctness is critical** — ML features must be computed as of a specific timestamp (no future data leakage). This is straightforward in batch, error-prone in streaming.
+The cleansing transform — deduplication, range validation, timezone normalization, quality flagging — runs as a batch transform (`@transform_df`) on the materialized batch view of the streaming dataset, not as a streaming transform.
 
-4. **Cost** — streaming jobs run 24/7. Batch jobs run for 30 minutes and shut down.
+**Why not stream the cleansing step?**
 
-## When Streaming Is Worth It
+1. **Deduplication requires state.** Deduplicating by `event_id` means checking every event against previously seen IDs. In a streaming context, this requires a stateful Flink operator with a large state backend. In batch, deduplication is a `dropDuplicates("event_id")` call over a bounded transaction — trivial.
 
-- **Real-time alerting** — "compressor pressure exceeding threshold" must fire in seconds, not hours
-- **Live operational dashboards** — operators need current state of equipment
-- **Feature freshness for online models** — if your serving model needs features computed in the last 5 minutes
+2. **Device registry lookups.** Unknown devices are routed to a quarantine dataset. In streaming, this requires a side-input join against the device registry, which must be kept in sync with the streaming operator's state. In batch, it's a standard left anti join — simple and correct.
 
-## Practical Rule
+3. **Range validation is stateless and cheap.** It doesn't benefit from real-time execution. A 5–15 minute delay between landing and cleaning is well within the 15-minute freshness SLA for the clean dataset ([Contract 2](../05-architecture/data-contracts.md)).
 
-> Do alerting in streaming, feature engineering in batch, and feature serving from a pre-computed store.
+4. **Foundry streaming transforms (Flink) have limited library support.** The cleansing logic uses PySpark functions that are well-tested in batch Transforms but would require different (and less mature) APIs in Flink.
 
-This gives you sub-second alerts, cost-effective feature computation, and low-latency model serving — without the complexity of maintaining a full streaming feature pipeline.
+The cleansing transform runs incrementally — it processes only the new transactions appended by the streaming dataset's batch materialization. See [Transform Patterns — Incremental Transforms](../04-palantir/transform-patterns.md) for the pattern.
 
-## PySpark Example: Batch Reads from Streaming Landing Zone
+### Batch for Feature Engineering and Scoring
 
-```python
-# Read from the landing zone written by the streaming job
-df = (
-    spark.read
-    .format("delta")
-    .load("s3://datalake/raw/sensor_telemetry/")
-    .where(col("timestamp") >= "2026-02-14")
-    .where(col("timestamp") < "2026-02-15")
-)
+Features are windowed aggregations (15-minute, 1-hour, 1-day windows) over clean data. These aggregations require looking back over time and across sensors — operations that are natural in batch but awkward and expensive in streaming.
 
-# Compute features in batch — simple, debuggable, replayable
-features = (
-    df
-    .groupBy("device_id")
-    .agg(
-        F.avg("value").alias("temp_mean_24h"),
-        F.stddev("value").alias("temp_std_24h"),
-        F.count("*").alias("reading_count_24h"),
-    )
-)
-```
+Batch scoring runs these features through anomaly detection models (Isolation Forest, Autoencoder, statistical). These models expect complete feature vectors, not individual sensor readings. Scoring the full fleet hourly on pre-aggregated features is orders of magnitude cheaper than scoring 14M raw readings/min.
 
-No state management, no watermarks, no late-arrival handling — the batch job just reads what's there and computes.
+See [ADR-002](../05-architecture/adr-002-batch-plus-streaming.md) for the detailed cost analysis and decision rationale.
+
+### Streaming for Acute Anomaly Detection
+
+Some failures develop in seconds, not hours:
+
+- Sudden compressor current spike (immediate overload risk)
+- Rapid pressure drop (acute refrigerant leak)
+- Compressor vibration exceeding 3× the 24-hour moving average (mechanical event)
+- Temperature rise rate exceeding threshold (complete cooling loss)
+
+These are detected by lightweight threshold rules running as Foundry streaming transforms on the streaming view of the ingestion dataset — _not_ by ML models. The streaming scoring path produces `CRITICAL` severity alerts directly.
+
+This is the only place in the pipeline where streaming _processing_ (not just streaming ingestion) is used.
+
+## When to Use Foundry Streaming Transforms vs Batch Transforms
+
+| Criterion | Streaming Transform | Batch Transform |
+|-----------|-------------------|-----------------|
+| **Latency requirement** | Sub-minute detection needed | 15 min – 1 hour is acceptable |
+| **Logic complexity** | Simple thresholds, single-sensor checks | Multi-sensor aggregations, joins, ML scoring |
+| **State management** | Minimal (threshold + moving average) | Full DataFrame operations, device registry joins |
+| **Foundry API maturity** | Flink-based, limited PySpark compatibility | Full PySpark, well-documented Transform idioms |
+| **Debugging and testing** | Harder — streaming state is opaque | Easier — datasets are inspectable, transforms are deterministic |
+| **Failure recovery** | Flink checkpointing, may replay events | Transaction rollback, idempotent reruns |
+| **Use in our pipeline** | Acute anomaly threshold checks only | Cleansing, feature engineering, model scoring |
+
+**Decision rule**: default to batch. Use streaming transforms only when the detection latency of the batch path (15 min–1 hour) would result in equipment damage or safety hazard.
+
+## Cost and Complexity Tradeoffs
+
+### Compute Cost
+
+| Path | What it processes | Volume | Compute profile |
+|------|-------------------|--------|-----------------|
+| Streaming ingestion | Raw device messages | 14M/min | Managed by Foundry (streaming dataset throughput tier) |
+| Streaming scoring | Raw readings, threshold checks only | 14M/min but trivial per-message compute | Small Flink job, < 200 lines of logic |
+| Batch cleansing | New landing zone transactions (incremental) | ~70M rows per 5-min transaction | Medium Spark profile, runs every 5–10 min |
+| Batch feature aggregation | Clean data, windowed aggregations | 100K devices × features per window | Medium–Large Spark profile, runs hourly |
+| Batch model scoring | Feature vectors | 100K rows per scoring run | Medium Spark profile, runs hourly |
+
+Streaming scoring adds a small, fixed compute cost. The cost is justified by the safety requirement — acute failures must be caught in under 2 minutes. If this path didn't exist, the batch path would need to run every minute, which would be far more expensive.
+
+### Complexity Cost
+
+Maintaining two processing paradigms (batch PySpark + streaming Flink) increases the maintenance surface:
+
+- **Two codebases**: batch transforms use `@transform_df` with PySpark; streaming transforms use Foundry's Flink API.
+- **Two testing strategies**: batch transforms can be tested with deterministic input DataFrames; streaming transforms require simulated event sequences.
+- **Two monitoring approaches**: batch transforms have transactional success/failure; streaming transforms have lag, throughput, and checkpoint metrics.
+
+This complexity is managed by keeping the streaming path deliberately simple — threshold checks only, no ML models, < 200 lines of code. The batch path handles all complex logic.
+
+### What Would Change This Decision
+
+The current hybrid approach is correct for the current constraints. These changes would force a reassessment:
+
+- **Acute failure prevalence increases**: if most failures become acute (not gradual), the batch path's hourly cadence becomes insufficient. We'd need to move feature engineering or model scoring into streaming — a significant architecture change.
+- **Foundry streaming transforms mature significantly**: if Foundry's Flink support gains full PySpark API compatibility and mature ML model serving, the cost differential between batch and streaming processing shrinks.
+- **Fleet grows beyond 500K devices**: at 5× scale, the batch cleansing transform processes ~350M rows per 5-min window. If this becomes too expensive per run, we might move cleansing to streaming to spread the cost continuously.
+- **Freshness SLAs tighten below 5 minutes**: if downstream consumers need clean data in under 5 minutes (e.g., for operational dashboards), batch cleansing at 5-min intervals is no longer sufficient.
+
+## Cross-References
+
+- [ADR-002: Hybrid Batch + Streaming](../05-architecture/adr-002-batch-plus-streaming.md) — the architectural decision record for the hybrid scoring approach
+- [Data Contracts](../05-architecture/data-contracts.md) — freshness SLAs for each pipeline stage
+- [Streaming Ingestion](../04-palantir/streaming-ingestion.md) — Foundry streaming dataset configuration and materialization intervals
+- [Transform Patterns](../04-palantir/transform-patterns.md) — batch transform idioms, incremental processing, windowed aggregations
+- [Architecture](./architecture.md) — the physical data flow and component responsibilities

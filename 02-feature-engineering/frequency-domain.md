@@ -1,147 +1,195 @@
 # Frequency-Domain Features
 
-Sensor data often contains periodic patterns (compressor cycles, day/night temperature swings, vibration harmonics) that are invisible in time-domain statistics but obvious in the frequency domain.
+Spectral analysis of sensor signals — when it works, when it doesn't, and what's actually computable at 1 reading per minute.
 
-## When to Use Frequency Features
+## The Honest Limitation Up Front
 
-- **Vibration sensors** — bearing faults show up as specific frequency peaks
-- **Temperature/pressure** — compressor cycling creates periodic patterns; cycle frequency changes indicate degradation
-- **Current/voltage** — electrical faults produce harmonic distortions
+Traditional frequency-domain analysis (vibration FFT for bearing fault detection, current spectrum analysis for motor diagnostics) requires sampling rates of hundreds to thousands of hertz. Our sensor data arrives at approximately **1 reading per minute** (~0.017 Hz). This is orders of magnitude too slow for classical vibration analysis.
 
-## FFT in PySpark
+The Nyquist theorem limits the maximum detectable frequency to half the sampling rate. At 1 sample/minute:
 
-PySpark doesn't have a native FFT. Two approaches:
+- **Maximum detectable frequency**: 0.5 cycles/minute = 0.0083 Hz
+- **Minimum detectable period**: 2 minutes
 
-### Approach 1: Pandas UDF (recommended for moderate scale)
+This means we **cannot** detect:
+
+- Bearing defect frequencies (typically 20–500 Hz)
+- Gear mesh frequencies (hundreds of Hz)
+- Motor electrical frequencies (50/60 Hz and harmonics)
+- Rotor imbalance frequencies (typically 10–60 Hz)
+
+These require dedicated high-frequency vibration sensors with their own data acquisition systems, which are outside [project scope](../05-architecture/system-overview.md).
+
+## What Frequency Analysis CAN Detect at 1/min
+
+Despite the severe sampling rate limitation, spectral analysis at 1/min can detect **slow periodic patterns** with periods of 2 minutes or longer. In refrigeration systems, several operationally significant behaviors fall in this range:
+
+### Compressor Short-Cycling
+
+**Period**: 2–15 minutes (well within our detection range)
+
+A healthy compressor runs for 10–30+ minutes, shuts off for a rest period, then restarts. A failing compressor may cycle on and off every 2–5 minutes. This "short-cycling" pattern has a characteristic frequency of 0.07–0.5 cycles/minute — detectable at 1/min sampling.
+
+Short-cycling shows up in `current_compressor` (oscillation between running current and zero) and `vibration_compressor` (oscillation between vibration and baseline). An FFT over a 1-hour window (60 samples) reveals whether the compressor is cycling at an abnormally high frequency.
+
+### Defrost Cycle Regularity
+
+**Period**: 4–12 hours (easily detectable)
+
+Defrost cycles follow a programmed schedule — typically every 6–8 hours. A device whose defrost frequency shifts (more frequent = ice buildup problem, less frequent = controller fault) shows a changed spectral signature in the `defrost_cycle` boolean signal over a 1-day window.
+
+This is better captured by `defrost_active_fraction` (see [Time-Domain](./time-domain.md)), but spectral analysis can confirm periodicity — an irregular defrost pattern (aperiodic rather than periodic) suggests a different failure mode than a shifted-but-regular pattern.
+
+### Door Usage Patterns
+
+**Period**: minutes to hours
+
+The `door_open_close` signal may exhibit periodic patterns tied to operational schedules (shift changes, delivery windows). Spectral analysis can distinguish between regular-interval door openings (expected) and random or sustained openings (potential issue). This is a secondary use case — `door_open_fraction` is usually sufficient.
+
+### Temperature Oscillations
+
+**Period**: 2–30 minutes
+
+Evaporator and condenser temperatures oscillate naturally as the compressor cycles. The dominant period of these oscillations correlates with compressor cycle time. A shift in the dominant oscillation period of `temperature_evaporator` from 20 minutes to 5 minutes indicates short-cycling, providing a cross-check with the current-based detection above.
+
+## Spectral Features
+
+Given the limitations above, the following spectral features are meaningful at 1/min sampling. These features are **not in the [Contract 3 schema](../05-architecture/data-contracts.md)** — they are candidates for future schema additions once validated against real anomaly labels.
+
+### Spectral Entropy
+
+**Definition**: the Shannon entropy of the normalized power spectrum. High entropy means the signal's energy is spread across many frequencies (noisy, unpredictable). Low entropy means the energy is concentrated in a few frequencies (periodic, predictable).
+
+**Application**: a healthy compressor produces a low-entropy current signal (regular on/off cycling at a consistent frequency). A degrading compressor produces higher entropy (irregular cycling, unstable operation).
 
 ```python
+# Conceptual Pandas UDF for spectral entropy — runs inside @transform_df
 import numpy as np
-from pyspark.sql.functions import pandas_udf
-from pyspark.sql.types import StructType, StructField, DoubleType, ArrayType
+from scipy.stats import entropy
 
-@pandas_udf(ArrayType(DoubleType()))
-def compute_fft_magnitudes(values: pd.Series) -> pd.Series:
-    """Compute FFT magnitude spectrum for each window of sensor values."""
-    results = []
-    for v in values:
-        if v is None or len(v) < 8:
-            results.append(None)
-            continue
-        arr = np.array(v)
-        # Remove DC component, apply Hanning window to reduce spectral leakage
-        arr = arr - np.mean(arr)
-        arr = arr * np.hanning(len(arr))
-        fft_vals = np.abs(np.fft.rfft(arr))
-        # Normalize by window length
-        fft_vals = fft_vals / len(arr)
-        results.append(fft_vals.tolist())
-    return pd.Series(results)
+def spectral_entropy(values: np.ndarray) -> float:
+    """Compute spectral entropy of a 1D signal."""
+    if len(values) < 4:
+        return None  # Not enough data for meaningful FFT
+    
+    # Compute power spectrum via FFT
+    fft_vals = np.fft.rfft(values - np.mean(values))  # Remove DC offset
+    power = np.abs(fft_vals) ** 2
+    
+    # Normalize to probability distribution
+    power_sum = np.sum(power)
+    if power_sum == 0:
+        return 0.0  # Constant signal
+    
+    power_norm = power / power_sum
+    
+    # Shannon entropy, normalized by log(N) to give range [0, 1]
+    return float(entropy(power_norm) / np.log(len(power_norm)))
 ```
 
-### Approach 2: Pre-aggregate in PySpark, FFT in post-processing
+**Sensors**: compute on `current_compressor` and `vibration_compressor` within 1-hour windows (60 samples). At 15-minute windows (15 samples), spectral resolution is too coarse for reliable entropy estimation.
 
-For very large datasets, collect windowed arrays in PySpark, then compute FFT in a separate step:
+**Null behavior**: return null if fewer than 4 non-null readings exist in the window (FFT on 3 or fewer points is meaningless).
+
+### Dominant Frequency
+
+**Definition**: the frequency with the highest power in the spectrum, excluding DC (0 Hz).
+
+**Application**: the dominant frequency of `current_compressor` in a 1-hour window corresponds to the compressor cycling rate. A shift from 0.05 cycles/min (20-minute cycle) to 0.2 cycles/min (5-minute cycle) indicates short-cycling. A shift toward lower frequency (longer cycles) might indicate a compressor struggling to reach setpoint.
 
 ```python
-from pyspark.sql import functions as F
-
-# Collect values into arrays per device per window
-df_windowed = (
-    df
-    .withColumn("window_id", F.window("timestamp", "1 hour"))
-    .groupBy("device_id", "window_id")
-    .agg(
-        F.sort_array(F.collect_list(F.struct("timestamp", "value"))).alias("readings")
-    )
-    .withColumn("values", F.transform(F.col("readings"), lambda x: x.value))
-)
-
-# Apply FFT via Pandas UDF
-df_fft = df_windowed.withColumn("fft_magnitudes", compute_fft_magnitudes(F.col("values")))
+def dominant_frequency(values: np.ndarray, sample_rate_per_min: float = 1.0) -> float:
+    """Return the dominant non-DC frequency in cycles per minute."""
+    if len(values) < 4:
+        return None
+    
+    fft_vals = np.fft.rfft(values - np.mean(values))
+    power = np.abs(fft_vals) ** 2
+    freqs = np.fft.rfftfreq(len(values), d=1.0 / sample_rate_per_min)
+    
+    # Exclude DC component (index 0)
+    if len(power) < 2:
+        return None
+    
+    dominant_idx = np.argmax(power[1:]) + 1
+    return float(freqs[dominant_idx])
 ```
 
-## Derived Frequency Features
+**Interpretation**: at 1 sample/min over a 60-sample window, the frequency resolution is 1/60 = 0.0167 cycles/min. This means we can distinguish between a 60-minute cycle and a 30-minute cycle, but not between a 5-minute and a 4.5-minute cycle. The resolution gets coarser for shorter windows.
 
-Raw FFT output is high-dimensional. Extract meaningful scalar features:
+### Spectral Energy Ratio
 
-```python
-@pandas_udf(DoubleType())
-def spectral_entropy(fft_magnitudes: pd.Series) -> pd.Series:
-    """Entropy of the normalized power spectrum. High = broadband noise. Low = dominant frequency."""
-    results = []
-    for mags in fft_magnitudes:
-        if mags is None or len(mags) == 0:
-            results.append(None)
-            continue
-        power = np.array(mags) ** 2
-        power_norm = power / (np.sum(power) + 1e-10)
-        entropy = -np.sum(power_norm * np.log2(power_norm + 1e-10))
-        results.append(float(entropy))
-    return pd.Series(results)
+**Definition**: ratio of energy in a specific frequency band to total energy.
 
-@pandas_udf(DoubleType())
-def dominant_frequency(fft_magnitudes: pd.Series) -> pd.Series:
-    """Index of the strongest frequency component (excluding DC)."""
-    results = []
-    for mags in fft_magnitudes:
-        if mags is None or len(mags) < 2:
-            results.append(None)
-            continue
-        # Skip index 0 (DC component)
-        dominant_idx = int(np.argmax(mags[1:])) + 1
-        results.append(float(dominant_idx))
-    return pd.Series(results)
+**Application**: define a "short-cycling band" (e.g., 0.1–0.5 cycles/min, corresponding to 2–10 minute cycles). The fraction of signal energy in this band serves as a short-cycling indicator. High ratio → compressor is spending most of its energy in rapid cycling.
 
-@pandas_udf(DoubleType())
-def spectral_centroid(fft_magnitudes: pd.Series) -> pd.Series:
-    """Weighted average frequency — shifts as equipment degrades."""
-    results = []
-    for mags in fft_magnitudes:
-        if mags is None or len(mags) == 0:
-            results.append(None)
-            continue
-        freqs = np.arange(len(mags))
-        mags_arr = np.array(mags)
-        centroid = np.sum(freqs * mags_arr) / (np.sum(mags_arr) + 1e-10)
-        results.append(float(centroid))
-    return pd.Series(results)
-```
+This is more targeted than spectral entropy — it asks "how much short-cycling is happening?" rather than "how irregular is the signal overall?"
 
-### Feature interpretation for predictive maintenance
+## Practical Considerations
 
-| Feature | Low value | High value | Maintenance signal |
-|---------|-----------|------------|-------------------|
-| Spectral entropy | Dominant single frequency (normal cycling) | Broadband noise (mechanical wear) | High entropy → inspect |
-| Dominant frequency | Low-frequency cycles (normal) | Shifted from baseline | Frequency shift → bearing/motor issue |
-| Spectral centroid | Energy in low frequencies | Energy shifting to high frequencies | Upward drift → increasing friction/wear |
+### Minimum Window Size for FFT
 
-## Sampling Rate Considerations
+FFT quality degrades rapidly with fewer samples. Guidelines for our sampling rate:
 
-FFT requires evenly-spaced samples. IoT sensors rarely provide this.
+| Window | Samples | Frequency Resolution | Usable? |
+|--------|---------|---------------------|---------|
+| 15-min | ~15 | 0.067 cycles/min | Marginally — can detect presence of oscillation but not its frequency accurately |
+| 1-hour | ~60 | 0.017 cycles/min | Yes — sufficient to characterize compressor cycling patterns |
+| 1-day | ~1440 | 0.0007 cycles/min | Yes — can detect hourly and multi-hour periodicities (defrost cycles, load patterns) |
 
-**Solution**: resample before FFT:
+Spectral features should be computed on 1-hour and 1-day windows only. The 15-minute window does not provide enough samples for frequency resolution that adds value beyond what time-domain statistics already capture.
 
-```python
-@pandas_udf(ArrayType(DoubleType()))
-def resample_and_fft(timestamps: pd.Series, values: pd.Series) -> pd.Series:
-    """Resample irregular sensor data to uniform spacing, then FFT."""
-    results = []
-    for ts_arr, val_arr in zip(timestamps, values):
-        if ts_arr is None or len(ts_arr) < 8:
-            results.append(None)
-            continue
-        # Create a pandas Series with datetime index
-        s = pd.Series(val_arr, index=pd.to_datetime(ts_arr))
-        # Resample to 1-second intervals, forward-fill gaps up to 5 seconds
-        s_uniform = s.resample("1s").mean().ffill(limit=5)
-        s_uniform = s_uniform.dropna()
-        if len(s_uniform) < 8:
-            results.append(None)
-            continue
-        arr = s_uniform.values - np.mean(s_uniform.values)
-        fft_vals = np.abs(np.fft.rfft(arr)) / len(arr)
-        results.append(fft_vals.tolist())
-    return pd.Series(results)
-```
+### Handling Missing Readings
 
-**Key rule**: document your resampling frequency. A feature computed at 1Hz vs 10Hz will have completely different frequency bins, and anyone who reuses the feature without knowing this will get wrong results.
+FFT assumes evenly-spaced samples. Missing readings (gaps in the time series) introduce spectral artifacts — false frequencies that don't exist in the underlying signal. Options:
+
+1. **Linear interpolation**: fill gaps by interpolating between adjacent readings. Acceptable for small gaps (1–2 missing readings). Larger gaps should set the spectral features to null for that window.
+2. **Zero-fill**: replace missing readings with zero. This introduces discontinuities that leak energy across all frequencies — avoid.
+3. **Skip the window**: if more than 20% of expected readings are missing, set spectral features to null. A spectral analysis on a signal with 30% gaps is unreliable.
+
+Recommendation: interpolate gaps of ≤ 2 minutes, null-out spectral features for windows with > 20% missing readings.
+
+### Compute Cost of FFT in Foundry
+
+FFT is not a native PySpark function. It requires a Pandas UDF (or equivalent) to execute NumPy/SciPy functions per device per window. At 100K devices:
+
+- **1-hour windows**: 100K devices × 24 windows/day = 2.4M FFT computations/day. Each FFT on 60 samples is trivially fast (microseconds), but the Pandas UDF serialization overhead adds up. Group devices into reasonably-sized partitions (1,000–10,000 devices per partition) to amortize UDF launch cost.
+- **1-day windows**: 100K × 1 window/day = 100K FFTs/day. Negligible.
+
+The bottleneck is not the FFT itself but the Arrow serialization between Spark and Pandas. Profile before optimizing — this may not be a bottleneck at all.
+
+### Schema Implications
+
+Spectral features are **not currently in the [`device_features` Contract 3 schema](../05-architecture/data-contracts.md)**. Before adding them:
+
+1. Validate on a subset of devices that spectral features improve anomaly detection (measure false positive/negative rates with and without)
+2. Add as nullable columns to Contract 3 — existing consumers are unaffected
+3. Follow the [schema evolution strategy](../05-architecture/data-contracts.md) — add nullable columns, never change existing ones
+
+This is intentional conservatism. Spectral features at 1/min sampling are experimental. The time-domain features (mean, std, slope) and cross-sensor features (pressure ratio, temperature spreads) are more reliable for anomaly detection at this sampling rate and should be the primary feature set.
+
+## What Would Require Higher-Rate Data
+
+For completeness, here's what frequency analysis could do with proper sampling rates — and what sensor infrastructure changes would be needed:
+
+| Analysis | Required Sampling Rate | What It Detects | Sensor Change Needed |
+|----------|----------------------|-----------------|---------------------|
+| Bearing defect detection | 1–10 kHz | Inner/outer race defects, ball pass frequencies | Dedicated accelerometer with high-speed DAQ |
+| Motor current signature | 1–5 kHz | Broken rotor bars, eccentricity, electrical faults | Current transformer with high-speed sampling |
+| Refrigerant flow noise | 500 Hz–5 kHz | Thermostatic expansion valve (TXV) hunting, flash gas | Acoustic sensor near TXV |
+| Compressor valve analysis | 5–20 kHz | Valve leakage, plate wear | High-frequency pressure transducer |
+
+These are outside the current [project scope](../05-architecture/system-overview.md) but represent a natural extension if the business case for predictive maintenance justifies the sensor investment. The feature engineering framework in Foundry would need a separate high-frequency ingestion path but could reuse the same windowing and [feature store](./feature-store.md) patterns.
+
+## Summary
+
+Frequency-domain features at 1/min sampling are a narrow but real capability: they detect slow periodicities like compressor short-cycling and defrost regularity. They do not replace proper vibration analysis. Treat spectral features as supplementary to the [time-domain](./time-domain.md) and [cross-sensor](./cross-sensor.md) features, validate them empirically before adding to the production schema, and be transparent with stakeholders about what they can and cannot detect.
+
+## Related Documents
+
+- [Time-Domain Features](./time-domain.md) — primary feature set (mean, std, min, max, slope, p95)
+- [Cross-Sensor Features](./cross-sensor.md) — derived features from sensor combinations
+- [Windowing Strategies](./windowing.md) — window sizes and alignment that determine FFT sample counts
+- [Feature Store](./feature-store.md) — how features are stored and served, including schema evolution for new features
+- [Data Contracts — Contract 3](../05-architecture/data-contracts.md) — current production schema (does not yet include spectral features)
+- [Transform Patterns](../04-palantir/transform-patterns.md) — Pandas UDF patterns for custom computations in Foundry
